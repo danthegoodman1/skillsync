@@ -12,7 +12,7 @@ use crate::path::{PathError, ProtocolPath};
 use crate::record::{Record, RecordError};
 use crate::roster::{RosterError, RosterHash, RosterRevision, select_chain};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 4;
 
 pub struct StateStore {
     connection: Connection,
@@ -103,26 +103,148 @@ impl StateStore {
         Ok(())
     }
 
+    pub fn replace_collection_path(
+        &mut self,
+        name: &str,
+        local_path: &Path,
+    ) -> Result<(), StateError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "UPDATE collections SET
+                local_path = ?2,
+                resolved_root = NULL,
+                scan_status = 'pending',
+                watch_status = 'pending'
+             WHERE name = ?1",
+            params![name, local_path.as_os_str().as_bytes()],
+        )?;
+        transaction.execute(
+            "UPDATE path_records SET
+                materialized = 0,
+                needs_repair = 1,
+                materialized_modified_ns = NULL,
+                materialized_size = NULL,
+                materialized_hash = NULL
+             WHERE collection = ?1 AND kind = 1",
+            [name],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn complete_collection_scan(
+        &mut self,
+        name: &str,
+        local_path: &Path,
+        resolved_root: &Path,
+    ) -> Result<bool, StateError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous = transaction
+            .query_row(
+                "SELECT resolved_root FROM collections WHERE name = ?1",
+                [name],
+                |row| row.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()?
+            .ok_or(StateError::MissingCollection)?;
+        let resolved_bytes = resolved_root.as_os_str().as_bytes();
+        let changed = previous.as_deref() != Some(resolved_bytes);
+        transaction.execute(
+            "UPDATE collections SET
+                local_path = ?2,
+                resolved_root = ?3,
+                scan_status = 'active'
+             WHERE name = ?1",
+            params![name, local_path.as_os_str().as_bytes(), resolved_bytes],
+        )?;
+        if changed {
+            transaction.execute(
+                "UPDATE path_records SET
+                    materialized = 0,
+                    needs_repair = 1,
+                    materialized_modified_ns = NULL,
+                    materialized_size = NULL,
+                    materialized_hash = NULL
+                 WHERE collection = ?1 AND kind = 1",
+                [name],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed)
+    }
+
+    pub fn set_collection_scan_status(
+        &self,
+        name: &str,
+        status: CollectionScanStatus,
+    ) -> Result<(), StateError> {
+        self.connection.execute(
+            "UPDATE collections SET scan_status = ?2 WHERE name = ?1",
+            params![name, status.as_str()],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_collection_watch_status(
+        &self,
+        name: &str,
+        status: CollectionWatchStatus,
+    ) -> Result<(), StateError> {
+        self.connection.execute(
+            "UPDATE collections SET watch_status = ?2 WHERE name = ?1",
+            params![name, status.as_str()],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_collection(&self, name: &str) -> Result<bool, StateError> {
+        Ok(self
+            .connection
+            .execute("DELETE FROM collections WHERE name = ?1", [name])?
+            != 0)
+    }
+
+    pub fn collections(&self) -> Result<Vec<CollectionState>, StateError> {
+        let mut statement = self.connection.prepare(
+            "SELECT name, local_path, resolved_root, scan_status, watch_status
+             FROM collections ORDER BY name",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Option<Vec<u8>>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        rows.map(|row| decode_collection(row?)).collect()
+    }
+
     pub fn collection(&self, name: &str) -> Result<Option<CollectionState>, StateError> {
         self.connection
             .query_row(
-                "SELECT name, local_path, resolved_root FROM collections WHERE name = ?1",
+                "SELECT name, local_path, resolved_root, scan_status, watch_status
+                 FROM collections WHERE name = ?1",
                 [name],
                 |row| {
-                    let name = row.get(0)?;
-                    let local_path = PathBuf::from(OsString::from_vec(row.get(1)?));
-                    let resolved_root = row
-                        .get::<_, Option<Vec<u8>>>(2)?
-                        .map(|bytes| PathBuf::from(OsString::from_vec(bytes)));
-                    Ok(CollectionState {
-                        name,
-                        local_path,
-                        resolved_root,
-                    })
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
                 },
             )
             .optional()
-            .map_err(Into::into)
+            .map_err(StateError::from)?
+            .map(decode_collection)
+            .transpose()
     }
 
     pub fn insert_roster_revision(&mut self, revision: &RosterRevision) -> Result<(), StateError> {
@@ -260,7 +382,9 @@ impl StateStore {
             .as_ref()
             .is_none_or(|current| record.compare_winner(current).is_gt());
         if accepted {
-            upsert_record(&transaction, record)?;
+            let materialized = source_peer.is_none()
+                || matches!(record.kind(), crate::record::RecordKind::Tombstone);
+            upsert_record(&transaction, record, materialized)?;
         }
         let event = match current {
             _ if accepted => OperationalEvent::RecordAccepted {
@@ -295,6 +419,190 @@ impl StateStore {
             )
             .optional()?;
         stored.map(decode_stored_record).transpose()
+    }
+
+    pub fn records(&self, collection: &str) -> Result<Vec<Record>, StateError> {
+        let mut statement = self.connection.prepare(
+            "SELECT record_hash, canonical FROM path_records
+             WHERE collection = ?1 ORDER BY path",
+        )?;
+        let rows = statement.query_map([collection], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        rows.map(|row| decode_stored_record(row?)).collect()
+    }
+
+    pub fn record_states(&self, collection: &str) -> Result<Vec<PathRecordState>, StateError> {
+        let mut statement = self.connection.prepare(
+            "SELECT record_hash, canonical, materialized, needs_repair,
+                    materialized_modified_ns, materialized_size, materialized_hash
+             FROM path_records WHERE collection = ?1 ORDER BY path",
+        )?;
+        let rows = statement.query_map([collection], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, bool>(2)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<Vec<u8>>>(6)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (
+                hash,
+                canonical,
+                materialized,
+                needs_repair,
+                materialized_modified_ns,
+                materialized_size,
+                materialized_hash,
+            ) = row?;
+            Ok(PathRecordState {
+                record: decode_stored_record((hash, canonical))?,
+                materialized,
+                needs_repair,
+                materialized_fingerprint: decode_materialized_fingerprint(
+                    materialized_modified_ns,
+                    materialized_size,
+                    materialized_hash,
+                )?,
+            })
+        })
+        .collect()
+    }
+
+    pub fn set_repair_required(
+        &self,
+        collection: &str,
+        path: &str,
+        required: bool,
+    ) -> Result<(), StateError> {
+        self.connection.execute(
+            "UPDATE path_records SET
+                needs_repair = ?3,
+                materialized = CASE WHEN ?3 THEN 0 ELSE materialized END,
+                materialized_modified_ns = CASE WHEN ?3 THEN NULL ELSE materialized_modified_ns END,
+                materialized_size = CASE WHEN ?3 THEN NULL ELSE materialized_size END,
+                materialized_hash = CASE WHEN ?3 THEN NULL ELSE materialized_hash END
+             WHERE collection = ?1 AND path = ?2",
+            params![collection, path, required],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_repair_required_and_log(
+        &mut self,
+        collection: &str,
+        path: &str,
+        created_ns: i64,
+        event: &OperationalEvent,
+        max_logs: usize,
+    ) -> Result<(), StateError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = transaction.execute(
+            "UPDATE path_records SET
+                needs_repair = 1,
+                materialized = 0,
+                materialized_modified_ns = NULL,
+                materialized_size = NULL,
+                materialized_hash = NULL
+             WHERE collection = ?1 AND path = ?2 AND kind = 1",
+            params![collection, path],
+        )?;
+        if updated != 1 {
+            return Err(StateError::MissingPathRecord);
+        }
+        insert_log(&transaction, created_ns, event, max_logs)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn set_materialized_fingerprint(
+        &mut self,
+        collection: &str,
+        path: &str,
+        fingerprint: MaterializedFingerprint,
+    ) -> Result<(), StateError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        update_materialized_fingerprint(&transaction, collection, path, fingerprint)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_materialized_and_log(
+        &mut self,
+        collection: &str,
+        path: &str,
+        materialized: MaterializedFile<'_>,
+        created_ns: i64,
+        event: &OperationalEvent,
+        max_logs: usize,
+    ) -> Result<(), StateError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous_root = transaction
+            .query_row(
+                "SELECT resolved_root FROM collections WHERE name = ?1",
+                [collection],
+                |row| row.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()?
+            .ok_or(StateError::MissingCollection)?;
+        let resolved_bytes = materialized.resolved_root.as_os_str().as_bytes();
+        if previous_root.as_deref() != Some(resolved_bytes) {
+            transaction.execute(
+                "UPDATE collections SET resolved_root = ?2 WHERE name = ?1",
+                params![collection, resolved_bytes],
+            )?;
+            transaction.execute(
+                "UPDATE path_records SET
+                    materialized = 0,
+                    needs_repair = 1,
+                    materialized_modified_ns = NULL,
+                    materialized_size = NULL,
+                    materialized_hash = NULL
+                 WHERE collection = ?1 AND path != ?2 AND kind = 1",
+                params![collection, path],
+            )?;
+        }
+        update_materialized_fingerprint(&transaction, collection, path, materialized.fingerprint)?;
+        insert_log(&transaction, created_ns, event, max_logs)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reject_future_log_inserts(&self) -> Result<(), StateError> {
+        self.connection.execute_batch(
+            "CREATE TEMP TRIGGER reject_operational_log_insert
+             BEFORE INSERT ON operational_logs
+             BEGIN
+                SELECT RAISE(FAIL, 'injected operational log failure');
+             END;",
+        )?;
+        Ok(())
+    }
+
+    pub fn local_counts(&self) -> Result<(u64, u64), StateError> {
+        let (files, degraded): (i64, i64) = self.connection.query_row(
+            "SELECT
+                coalesce(sum(CASE WHEN kind = 1 AND materialized = 1 THEN 1 ELSE 0 END), 0),
+                coalesce(sum(CASE WHEN kind = 1 AND materialized = 0 THEN 1 ELSE 0 END), 0)
+             FROM path_records",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((
+            u64::try_from(files).map_err(|_| StateError::NumberOverflow)?,
+            u64::try_from(degraded).map_err(|_| StateError::NumberOverflow)?,
+        ))
     }
 
     pub fn upsert_peer_hint(
@@ -339,7 +647,7 @@ impl StateStore {
 
     pub fn logs(&self) -> Result<Vec<OperationalLog>, StateError> {
         let mut statement = self.connection.prepare(
-            "SELECT created_ns, event_kind, collection, path, peer_endpoint,
+            "SELECT id, created_ns, event_kind, collection, path, peer_endpoint,
                     candidate_modified_ns, candidate_author,
                     winner_modified_ns, winner_author
              FROM operational_logs ORDER BY id",
@@ -347,26 +655,73 @@ impl StateStore {
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
                 StoredOperationalEvent {
-                    event_kind: row.get(1)?,
-                    collection: row.get(2)?,
-                    path: row.get(3)?,
-                    peer_endpoint: row.get(4)?,
-                    candidate_modified_ns: row.get(5)?,
-                    candidate_author: row.get(6)?,
-                    winner_modified_ns: row.get(7)?,
-                    winner_author: row.get(8)?,
+                    event_kind: row.get(2)?,
+                    collection: row.get(3)?,
+                    path: row.get(4)?,
+                    peer_endpoint: row.get(5)?,
+                    candidate_modified_ns: row.get(6)?,
+                    candidate_author: row.get(7)?,
+                    winner_modified_ns: row.get(8)?,
+                    winner_author: row.get(9)?,
                 },
             ))
         })?;
         rows.map(|row| {
-            let (created_ns, stored_event) = row?;
+            let (id, created_ns, stored_event) = row?;
             Ok(OperationalLog {
+                id,
                 created_ns,
                 event: decode_operational_event(stored_event)?,
             })
         })
         .collect()
+    }
+
+    pub fn logs_page(&self, after_id: i64, limit: usize) -> Result<OperationalLogPage, StateError> {
+        let limit = limit.clamp(1, 64);
+        let query_limit = i64::try_from(limit + 1).map_err(|_| StateError::NumberOverflow)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, created_ns, event_kind, collection, path, peer_endpoint,
+                    candidate_modified_ns, candidate_author,
+                    winner_modified_ns, winner_author
+             FROM operational_logs WHERE id > ?1 ORDER BY id LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![after_id, query_limit], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                StoredOperationalEvent {
+                    event_kind: row.get(2)?,
+                    collection: row.get(3)?,
+                    path: row.get(4)?,
+                    peer_endpoint: row.get(5)?,
+                    candidate_modified_ns: row.get(6)?,
+                    candidate_author: row.get(7)?,
+                    winner_modified_ns: row.get(8)?,
+                    winner_author: row.get(9)?,
+                },
+            ))
+        })?;
+        let mut logs = rows
+            .map(|row| {
+                let (id, created_ns, stored) = row?;
+                Ok(OperationalLog {
+                    id,
+                    created_ns,
+                    event: decode_operational_event(stored)?,
+                })
+            })
+            .collect::<Result<Vec<_>, StateError>>()?;
+        let has_more = logs.len() > limit;
+        logs.truncate(limit);
+        let next_after_id = logs.last().map_or(after_id, |log| log.id);
+        Ok(OperationalLogPage {
+            logs,
+            next_after_id,
+            has_more,
+        })
     }
 
     fn migrate(&mut self) -> Result<(), StateError> {
@@ -466,6 +821,93 @@ impl StateStore {
             )?;
             transaction.commit()?;
         }
+        if version < 2 {
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(
+                "ALTER TABLE operational_logs RENAME TO operational_logs_v1;
+                 CREATE TABLE operational_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_ns INTEGER NOT NULL,
+                    event_kind TEXT NOT NULL CHECK (
+                        event_kind IN (
+                            'state_opened', 'daemon_started', 'daemon_stopped',
+                            'collection_attached', 'collection_detached',
+                            'collection_paused', 'collection_scanned',
+                            'symlink_escape', 'symlink_cycle', 'path_rejected',
+                            'timestamp_rejected', 'record_accepted',
+                            'record_rejected', 'file_installed',
+                            'file_apply_rejected', 'repair_required',
+                            'peer_unreachable'
+                        )
+                    ),
+                    collection TEXT CHECK (
+                        collection IS NULL OR length(collection) BETWEEN 1 AND 255
+                    ),
+                    path TEXT CHECK (path IS NULL OR length(path) BETWEEN 1 AND 4096),
+                    peer_endpoint BLOB CHECK (
+                        peer_endpoint IS NULL OR length(peer_endpoint) = 32
+                    ),
+                    candidate_modified_ns INTEGER,
+                    candidate_author BLOB CHECK (
+                        candidate_author IS NULL OR length(candidate_author) = 32
+                    ),
+                    winner_modified_ns INTEGER,
+                    winner_author BLOB CHECK (
+                        winner_author IS NULL OR length(winner_author) = 32
+                    )
+                 );
+                 INSERT INTO operational_logs
+                    (id, created_ns, event_kind, collection, path, peer_endpoint,
+                     candidate_modified_ns, candidate_author,
+                     winner_modified_ns, winner_author)
+                 SELECT id, created_ns, event_kind, collection, path, peer_endpoint,
+                        candidate_modified_ns, candidate_author,
+                        winner_modified_ns, winner_author
+                 FROM operational_logs_v1;
+                 DROP TABLE operational_logs_v1;
+                 PRAGMA user_version = 2;",
+            )?;
+            transaction.commit()?;
+        }
+        if version < 3 {
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(
+                "ALTER TABLE collections ADD COLUMN scan_status TEXT NOT NULL
+                    DEFAULT 'pending' CHECK (
+                        scan_status IN ('pending', 'active', 'missing', 'not_directory', 'error')
+                    );
+                 ALTER TABLE collections ADD COLUMN watch_status TEXT NOT NULL
+                    DEFAULT 'pending' CHECK (
+                        watch_status IN ('pending', 'active', 'root_unavailable', 'backend_error')
+                    );
+                 ALTER TABLE path_records ADD COLUMN materialized INTEGER NOT NULL
+                    DEFAULT 1 CHECK (materialized IN (0, 1));
+                 UPDATE path_records SET materialized = NOT needs_repair;
+                 PRAGMA user_version = 3;",
+            )?;
+            transaction.commit()?;
+        }
+        if version < 4 {
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(
+                "ALTER TABLE path_records ADD COLUMN materialized_modified_ns INTEGER;
+                 ALTER TABLE path_records ADD COLUMN materialized_size INTEGER;
+                 ALTER TABLE path_records ADD COLUMN materialized_hash BLOB;
+                 UPDATE path_records SET
+                    materialized_modified_ns = modified_ns,
+                    materialized_size = file_size,
+                    materialized_hash = content_hash
+                 WHERE kind = 1 AND materialized = 1;
+                 PRAGMA user_version = 4;",
+            )?;
+            transaction.commit()?;
+        }
         Ok(())
     }
 }
@@ -475,12 +917,122 @@ pub struct CollectionState {
     pub name: String,
     pub local_path: PathBuf,
     pub resolved_root: Option<PathBuf>,
+    pub scan_status: CollectionScanStatus,
+    pub watch_status: CollectionWatchStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CollectionScanStatus {
+    Pending,
+    Active,
+    Missing,
+    NotDirectory,
+    Error,
+}
+
+impl CollectionScanStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Active => "active",
+            Self::Missing => "missing",
+            Self::NotDirectory => "not_directory",
+            Self::Error => "error",
+        }
+    }
+
+    fn from_str(value: &str) -> Result<Self, StateError> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "active" => Ok(Self::Active),
+            "missing" => Ok(Self::Missing),
+            "not_directory" => Ok(Self::NotDirectory),
+            "error" => Ok(Self::Error),
+            _ => Err(StateError::InvalidStoredState(
+                "collection scan status is unknown",
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CollectionWatchStatus {
+    Pending,
+    Active,
+    RootUnavailable,
+    BackendError,
+}
+
+impl CollectionWatchStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Active => "active",
+            Self::RootUnavailable => "root_unavailable",
+            Self::BackendError => "backend_error",
+        }
+    }
+
+    fn from_str(value: &str) -> Result<Self, StateError> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "active" => Ok(Self::Active),
+            "root_unavailable" => Ok(Self::RootUnavailable),
+            "backend_error" => Ok(Self::BackendError),
+            _ => Err(StateError::InvalidStoredState(
+                "collection watch status is unknown",
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PathRecordState {
+    pub record: Record,
+    pub materialized: bool,
+    pub needs_repair: bool,
+    pub materialized_fingerprint: Option<MaterializedFingerprint>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaterializedFingerprint {
+    pub modified_ns: i64,
+    pub size: u64,
+    pub hash: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaterializedFile<'a> {
+    pub resolved_root: &'a Path,
+    pub fingerprint: MaterializedFingerprint,
+}
+
+fn decode_collection(
+    stored: (String, Vec<u8>, Option<Vec<u8>>, String, String),
+) -> Result<CollectionState, StateError> {
+    Ok(CollectionState {
+        name: stored.0,
+        local_path: PathBuf::from(OsString::from_vec(stored.1)),
+        resolved_root: stored
+            .2
+            .map(|bytes| PathBuf::from(OsString::from_vec(bytes))),
+        scan_status: CollectionScanStatus::from_str(&stored.3)?,
+        watch_status: CollectionWatchStatus::from_str(&stored.4)?,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperationalLog {
+    pub id: i64,
     pub created_ns: i64,
     pub event: OperationalEvent,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationalLogPage {
+    pub logs: Vec<OperationalLog>,
+    pub next_after_id: i64,
+    pub has_more: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -493,6 +1045,25 @@ pub enum LogLevel {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OperationalEvent {
     StateOpened,
+    DaemonStarted,
+    DaemonStopped,
+    CollectionAttached {
+        collection: String,
+    },
+    CollectionDetached {
+        collection: String,
+    },
+    CollectionPaused {
+        collection: String,
+    },
+    CollectionScanned {
+        collection: String,
+    },
+    CollectionWarning {
+        collection: String,
+        path: Option<ProtocolPath>,
+        issue: CollectionIssue,
+    },
     RecordAccepted {
         collection: String,
         path: ProtocolPath,
@@ -507,18 +1078,47 @@ pub enum OperationalEvent {
         winner_modified_ns: i64,
         winner_author: EndpointId,
     },
+    FileInstalled {
+        collection: String,
+        path: ProtocolPath,
+    },
+    FileApplyRejected {
+        collection: String,
+        path: ProtocolPath,
+    },
+    RepairRequired {
+        collection: String,
+        path: ProtocolPath,
+    },
     PeerUnreachable {
         peer_endpoint: EndpointId,
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CollectionIssue {
+    SymlinkEscape,
+    SymlinkCycle,
+    PathRejected,
+    TimestampRejected,
+}
+
 impl OperationalEvent {
     pub const fn level(&self) -> LogLevel {
         match self {
-            Self::StateOpened => LogLevel::Debug,
-            Self::RecordAccepted { .. } => LogLevel::Info,
-            Self::RecordRejected { .. } => LogLevel::Warn,
-            Self::PeerUnreachable { .. } => LogLevel::Warn,
+            Self::StateOpened | Self::CollectionScanned { .. } => LogLevel::Debug,
+            Self::DaemonStarted
+            | Self::DaemonStopped
+            | Self::CollectionAttached { .. }
+            | Self::CollectionDetached { .. }
+            | Self::RecordAccepted { .. }
+            | Self::FileInstalled { .. } => LogLevel::Info,
+            Self::CollectionPaused { .. }
+            | Self::CollectionWarning { .. }
+            | Self::RecordRejected { .. }
+            | Self::FileApplyRejected { .. }
+            | Self::RepairRequired { .. }
+            | Self::PeerUnreachable { .. } => LogLevel::Warn,
         }
     }
 }
@@ -554,7 +1154,11 @@ fn roster_hash_from_blob(bytes: Vec<u8>) -> Result<RosterHash, StateError> {
     Ok(RosterHash::from_bytes(bytes))
 }
 
-fn upsert_record(transaction: &Transaction<'_>, record: &Record) -> Result<(), StateError> {
+fn upsert_record(
+    transaction: &Transaction<'_>,
+    record: &Record,
+    materialized: bool,
+) -> Result<(), StateError> {
     let (kind, file_size, content_hash): (i64, Option<i64>, Option<[u8; 32]>) = match record.kind()
     {
         crate::record::RecordKind::Tombstone => (0, None, None),
@@ -564,11 +1168,28 @@ fn upsert_record(transaction: &Transaction<'_>, record: &Record) -> Result<(), S
             Some(content_hash),
         ),
     };
+    let materialized_fingerprint = if materialized {
+        match record.kind() {
+            crate::record::RecordKind::Tombstone => None,
+            crate::record::RecordKind::File { size, content_hash } => {
+                Some(MaterializedFingerprint {
+                    modified_ns: record.modified_ns(),
+                    size,
+                    hash: content_hash,
+                })
+            }
+        }
+    } else {
+        None
+    };
     transaction.execute(
         "INSERT INTO path_records
             (collection, path, record_hash, modified_ns, author, kind, file_size,
-             content_hash, canonical, needs_repair)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)
+             content_hash, canonical, needs_repair, materialized,
+             materialized_modified_ns, materialized_size, materialized_hash)
+         VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NOT ?10, ?10, ?11, ?12, ?13
+         )
          ON CONFLICT(collection, path) DO UPDATE SET
             record_hash = excluded.record_hash,
             modified_ns = excluded.modified_ns,
@@ -577,7 +1198,11 @@ fn upsert_record(transaction: &Transaction<'_>, record: &Record) -> Result<(), S
             file_size = excluded.file_size,
             content_hash = excluded.content_hash,
             canonical = excluded.canonical,
-            needs_repair = excluded.needs_repair",
+            needs_repair = excluded.needs_repair,
+            materialized = excluded.materialized,
+            materialized_modified_ns = excluded.materialized_modified_ns,
+            materialized_size = excluded.materialized_size,
+            materialized_hash = excluded.materialized_hash",
         params![
             record.collection(),
             record.path().as_str(),
@@ -587,10 +1212,68 @@ fn upsert_record(transaction: &Transaction<'_>, record: &Record) -> Result<(), S
             kind,
             file_size,
             content_hash,
-            record.canonical_bytes()
+            record.canonical_bytes(),
+            materialized,
+            materialized_fingerprint.map(|value| value.modified_ns),
+            materialized_fingerprint
+                .map(|value| i64::try_from(value.size))
+                .transpose()
+                .map_err(|_| StateError::NumberOverflow)?,
+            materialized_fingerprint.map(|value| value.hash),
         ],
     )?;
     Ok(())
+}
+
+fn update_materialized_fingerprint(
+    transaction: &Transaction<'_>,
+    collection: &str,
+    path: &str,
+    fingerprint: MaterializedFingerprint,
+) -> Result<(), StateError> {
+    let size = i64::try_from(fingerprint.size).map_err(|_| StateError::NumberOverflow)?;
+    let updated = transaction.execute(
+        "UPDATE path_records SET
+            materialized = 1,
+            needs_repair = 0,
+            materialized_modified_ns = ?3,
+            materialized_size = ?4,
+            materialized_hash = ?5
+         WHERE collection = ?1 AND path = ?2 AND kind = 1",
+        params![
+            collection,
+            path,
+            fingerprint.modified_ns,
+            size,
+            fingerprint.hash
+        ],
+    )?;
+    if updated != 1 {
+        return Err(StateError::MissingPathRecord);
+    }
+    Ok(())
+}
+
+fn decode_materialized_fingerprint(
+    modified_ns: Option<i64>,
+    size: Option<i64>,
+    hash: Option<Vec<u8>>,
+) -> Result<Option<MaterializedFingerprint>, StateError> {
+    match (modified_ns, size, hash) {
+        (None, None, None) => Ok(None),
+        (Some(modified_ns), Some(size), Some(hash)) => Ok(Some(MaterializedFingerprint {
+            modified_ns,
+            size: u64::try_from(size).map_err(|_| {
+                StateError::InvalidStoredState("materialized file size is negative")
+            })?,
+            hash: hash.try_into().map_err(|_| {
+                StateError::InvalidStoredState("materialized file hash has the wrong length")
+            })?,
+        })),
+        _ => Err(StateError::InvalidStoredState(
+            "materialized fingerprint is incomplete",
+        )),
+    }
 }
 
 fn load_record(
@@ -637,6 +1320,71 @@ fn insert_log(
         winner_author,
     ) = match event {
         OperationalEvent::StateOpened => ("state_opened", None, None, None, None, None, None, None),
+        OperationalEvent::DaemonStarted => {
+            ("daemon_started", None, None, None, None, None, None, None)
+        }
+        OperationalEvent::DaemonStopped => {
+            ("daemon_stopped", None, None, None, None, None, None, None)
+        }
+        OperationalEvent::CollectionAttached { collection } => (
+            "collection_attached",
+            Some(collection.as_str()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        OperationalEvent::CollectionDetached { collection } => (
+            "collection_detached",
+            Some(collection.as_str()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        OperationalEvent::CollectionPaused { collection } => (
+            "collection_paused",
+            Some(collection.as_str()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        OperationalEvent::CollectionScanned { collection } => (
+            "collection_scanned",
+            Some(collection.as_str()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        OperationalEvent::CollectionWarning {
+            collection,
+            path,
+            issue,
+        } => (
+            match issue {
+                CollectionIssue::SymlinkEscape => "symlink_escape",
+                CollectionIssue::SymlinkCycle => "symlink_cycle",
+                CollectionIssue::PathRejected => "path_rejected",
+                CollectionIssue::TimestampRejected => "timestamp_rejected",
+            },
+            Some(collection.as_str()),
+            path.as_ref().map(ProtocolPath::as_str),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
         OperationalEvent::RecordAccepted {
             collection,
             path,
@@ -668,6 +1416,36 @@ fn insert_log(
             Some(*candidate_author.as_bytes()),
             Some(*winner_modified_ns),
             Some(*winner_author.as_bytes()),
+        ),
+        OperationalEvent::FileInstalled { collection, path } => (
+            "file_installed",
+            Some(collection.as_str()),
+            Some(path.as_str()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        OperationalEvent::FileApplyRejected { collection, path } => (
+            "file_apply_rejected",
+            Some(collection.as_str()),
+            Some(path.as_str()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        OperationalEvent::RepairRequired { collection, path } => (
+            "repair_required",
+            Some(collection.as_str()),
+            Some(path.as_str()),
+            None,
+            None,
+            None,
+            None,
+            None,
         ),
         OperationalEvent::PeerUnreachable { peer_endpoint } => (
             "peer_unreachable",
@@ -725,6 +1503,37 @@ fn decode_operational_event(
     let peer_endpoint = stored.peer_endpoint.map(endpoint_from_blob).transpose()?;
     match stored.event_kind.as_str() {
         "state_opened" => Ok(OperationalEvent::StateOpened),
+        "daemon_started" => Ok(OperationalEvent::DaemonStarted),
+        "daemon_stopped" => Ok(OperationalEvent::DaemonStopped),
+        "collection_attached" => Ok(OperationalEvent::CollectionAttached {
+            collection: required(stored.collection, "collection log name is missing")?,
+        }),
+        "collection_detached" => Ok(OperationalEvent::CollectionDetached {
+            collection: required(stored.collection, "collection log name is missing")?,
+        }),
+        "collection_paused" => Ok(OperationalEvent::CollectionPaused {
+            collection: required(stored.collection, "collection log name is missing")?,
+        }),
+        "collection_scanned" => Ok(OperationalEvent::CollectionScanned {
+            collection: required(stored.collection, "collection log name is missing")?,
+        }),
+        "symlink_escape" | "symlink_cycle" | "path_rejected" | "timestamp_rejected" => {
+            let issue = match stored.event_kind.as_str() {
+                "symlink_escape" => CollectionIssue::SymlinkEscape,
+                "symlink_cycle" => CollectionIssue::SymlinkCycle,
+                "path_rejected" => CollectionIssue::PathRejected,
+                "timestamp_rejected" => CollectionIssue::TimestampRejected,
+                _ => unreachable!(),
+            };
+            Ok(OperationalEvent::CollectionWarning {
+                collection: required(stored.collection, "collection log name is missing")?,
+                path: stored
+                    .path
+                    .map(|path| ProtocolPath::parse(&path))
+                    .transpose()?,
+                issue,
+            })
+        }
         "record_accepted" => Ok(OperationalEvent::RecordAccepted {
             collection: required(stored.collection, "record log collection is missing")?,
             path: ProtocolPath::parse(&required(stored.path, "record log path is missing")?)?,
@@ -751,6 +1560,16 @@ fn decode_operational_event(
                 "rejected record winner author is missing",
             )?)?,
         }),
+        "file_installed" | "file_apply_rejected" | "repair_required" => {
+            let collection = required(stored.collection, "file log collection is missing")?;
+            let path = ProtocolPath::parse(&required(stored.path, "file log path is missing")?)?;
+            Ok(match stored.event_kind.as_str() {
+                "file_installed" => OperationalEvent::FileInstalled { collection, path },
+                "file_apply_rejected" => OperationalEvent::FileApplyRejected { collection, path },
+                "repair_required" => OperationalEvent::RepairRequired { collection, path },
+                _ => unreachable!(),
+            })
+        }
         "peer_unreachable" => Ok(OperationalEvent::PeerUnreachable {
             peer_endpoint: required(peer_endpoint, "unreachable peer EndpointID is missing")?,
         }),
@@ -781,6 +1600,10 @@ pub enum StateError {
     UnsupportedSchema(i64),
     #[error("stored state is invalid: {0}")]
     InvalidStoredState(&'static str),
+    #[error("collection is missing from local state")]
+    MissingCollection,
+    #[error("file path is missing from local state")]
+    MissingPathRecord,
     #[error("roster topology is invalid: {0}")]
     RosterTopology(&'static str),
     #[error("numeric state cannot be represented in SQLite")]
@@ -1089,6 +1912,8 @@ mod tests {
                 name: ".agents".to_owned(),
                 local_path: PathBuf::from("/skills"),
                 resolved_root: Some(PathBuf::from("/real")),
+                scan_status: CollectionScanStatus::Pending,
+                watch_status: CollectionWatchStatus::Pending,
             })
         );
         assert_eq!(
@@ -1107,6 +1932,7 @@ mod tests {
         assert_eq!(
             reopened.logs().unwrap()[0],
             OperationalLog {
+                id: 1,
                 created_ns: 10,
                 event: OperationalEvent::RecordAccepted {
                     collection: ".agents".to_owned(),
@@ -1129,6 +1955,184 @@ mod tests {
         assert_eq!(logs.len(), 3);
         assert_eq!(logs[0].created_ns, 2);
         assert_eq!(logs[2].created_ns, 4);
+    }
+
+    #[test]
+    fn operational_log_pages_use_stable_ids_across_retention_wrap() {
+        let mut store = StateStore::open_in_memory().unwrap();
+        for index in 0..10 {
+            store
+                .append_log(index, &OperationalEvent::StateOpened, 3)
+                .unwrap();
+        }
+        let first = store.logs_page(0, 2).unwrap();
+        assert_eq!(
+            first.logs.iter().map(|log| log.id).collect::<Vec<_>>(),
+            vec![8, 9]
+        );
+        assert_eq!(first.next_after_id, 9);
+        assert!(first.has_more);
+        let second = store.logs_page(first.next_after_id, 2).unwrap();
+        assert_eq!(
+            second.logs.iter().map(|log| log.id).collect::<Vec<_>>(),
+            vec![10]
+        );
+        assert!(!second.has_more);
+
+        store
+            .append_log(10, &OperationalEvent::StateOpened, 3)
+            .unwrap();
+        let followed = store.logs_page(second.next_after_id, 64).unwrap();
+        assert_eq!(followed.logs[0].id, 11);
+    }
+
+    #[test]
+    fn materialized_fingerprint_replaces_in_place_per_path() {
+        let mut store = StateStore::open_in_memory().unwrap();
+        store
+            .add_collection(".agents", Path::new("/skills"), None)
+            .unwrap();
+        let record = sample_record(10, 7);
+        store
+            .merge_record(&record, 10, Some(record.author()), 100)
+            .unwrap();
+        let first = MaterializedFingerprint {
+            modified_ns: 9,
+            size: 5,
+            hash: [7; 32],
+        };
+        let second = MaterializedFingerprint {
+            modified_ns: 8,
+            size: 5,
+            hash: [7; 32],
+        };
+        store
+            .set_materialized_fingerprint(".agents", "review/SKILL.md", first)
+            .unwrap();
+        store
+            .set_materialized_fingerprint(".agents", "review/SKILL.md", second)
+            .unwrap();
+        let states = store.record_states(".agents").unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].materialized_fingerprint, Some(second));
+    }
+
+    #[test]
+    fn materialization_root_change_unmaterializes_other_file_winners_atomically() {
+        let mut store = StateStore::open_in_memory().unwrap();
+        store
+            .add_collection(
+                ".agents",
+                Path::new("/configured"),
+                Some(Path::new("/physical-b")),
+            )
+            .unwrap();
+        let first = sample_record(10, 7);
+        let second = Record::file(
+            ".agents",
+            ProtocolPath::parse("other/SKILL.md").unwrap(),
+            11,
+            EndpointId::from_bytes([4; 32]),
+            5,
+            [8; 32],
+        )
+        .unwrap();
+        store
+            .merge_record(&first, 10, Some(first.author()), 100)
+            .unwrap();
+        store
+            .merge_record(&second, 11, Some(second.author()), 100)
+            .unwrap();
+        let first_fingerprint = MaterializedFingerprint {
+            modified_ns: 10,
+            size: 5,
+            hash: [7; 32],
+        };
+        let second_fingerprint = MaterializedFingerprint {
+            modified_ns: 11,
+            size: 5,
+            hash: [8; 32],
+        };
+        store
+            .set_materialized_fingerprint(".agents", first.path().as_str(), first_fingerprint)
+            .unwrap();
+        store
+            .set_materialized_fingerprint(".agents", second.path().as_str(), second_fingerprint)
+            .unwrap();
+
+        store
+            .mark_materialized_and_log(
+                ".agents",
+                first.path().as_str(),
+                MaterializedFile {
+                    resolved_root: Path::new("/physical-a"),
+                    fingerprint: first_fingerprint,
+                },
+                12,
+                &OperationalEvent::FileInstalled {
+                    collection: ".agents".to_owned(),
+                    path: first.path().clone(),
+                },
+                100,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.collection(".agents").unwrap().unwrap().resolved_root,
+            Some(PathBuf::from("/physical-a"))
+        );
+        let states = store.record_states(".agents").unwrap();
+        let installed = states
+            .iter()
+            .find(|state| state.record.path() == first.path())
+            .unwrap();
+        assert!(installed.materialized);
+        assert!(!installed.needs_repair);
+        assert_eq!(installed.materialized_fingerprint, Some(first_fingerprint));
+        let detached = states
+            .iter()
+            .find(|state| state.record.path() == second.path())
+            .unwrap();
+        assert!(!detached.materialized);
+        assert!(detached.needs_repair);
+        assert_eq!(detached.materialized_fingerprint, None);
+    }
+
+    #[test]
+    fn repair_transition_rolls_back_when_its_log_fails() {
+        let mut store = StateStore::open_in_memory().unwrap();
+        store
+            .add_collection(".agents", Path::new("/skills"), None)
+            .unwrap();
+        let record = sample_record(10, 7);
+        store
+            .merge_record(&record, 10, Some(record.author()), 100)
+            .unwrap();
+        let fingerprint = MaterializedFingerprint {
+            modified_ns: 10,
+            size: 5,
+            hash: [7; 32],
+        };
+        store
+            .set_materialized_fingerprint(".agents", record.path().as_str(), fingerprint)
+            .unwrap();
+        let before = store.record_states(".agents").unwrap();
+        store.reject_future_log_inserts().unwrap();
+
+        let result = store.mark_repair_required_and_log(
+            ".agents",
+            record.path().as_str(),
+            11,
+            &OperationalEvent::CollectionWarning {
+                collection: ".agents".to_owned(),
+                path: Some(record.path().clone()),
+                issue: CollectionIssue::TimestampRejected,
+            },
+            100,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(store.record_states(".agents").unwrap(), before);
     }
 
     #[test]

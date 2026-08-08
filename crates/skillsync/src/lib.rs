@@ -1,7 +1,12 @@
 pub mod canonical;
 pub mod config;
+pub mod daemon;
+pub mod filesystem;
 pub mod identity;
+pub mod installer;
 pub mod path;
 pub mod record;
+mod root;
 pub mod roster;
+pub mod setup;
 pub mod state;

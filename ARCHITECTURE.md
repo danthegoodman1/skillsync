@@ -211,8 +211,12 @@ winning bytes from peers. It continues advertising the winning record and keeps
 the path visibly degraded until a reachable peer supplies those bytes.
 
 The daemon preserves a received file's winning write time when it atomically
-installs the file. A short watcher-suppression entry prevents that installation
-from being mistaken for a new edit.
+installs the file. It stores the installed file's observed write time, size,
+and hash with the current path record so later and restarted scans recognize
+the materialized winner at the filesystem's timestamp precision. The same
+transaction binds the materialized record to the physical collection root
+opened for installation. A changed physical root unmaterializes the other file
+winners before the installed record is marked materialized.
 
 ### Deletions
 
@@ -276,9 +280,12 @@ configured limits before accepting bytes. It then:
 1. streams content into a temporary file inside the destination collection
 2. computes BLAKE3 while receiving
 3. rejects a size or hash mismatch
-4. flushes the completed temporary file
-5. atomically renames it over the destination
-6. applies the winning filesystem write time
+4. applies the winning filesystem write time to the temporary file
+5. flushes and synchronizes the completed temporary file
+6. atomically renames it over the destination
+7. synchronizes the destination directory
+
+New destination directories are synchronized as they are created.
 
 An interrupted transfer leaves only an ignorable temporary file. The previous
 valid file remains visible until replacement succeeds.
@@ -351,7 +358,8 @@ SQLite stores only the state needed to restart safely:
 - the device name and references to protected identity keys
 - group identity and signed roster revisions
 - configured collection names, paths, and resolved roots
-- the winning record for each known path, including tombstones
+- the winning record for each known path, including tombstones, and the
+  observed fingerprint for its current materialized file
 - peer EndpointIDs and recent iroh address hints
 - a bounded operational log
 

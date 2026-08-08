@@ -51,6 +51,8 @@ impl fmt::Display for ProtocolPath {
 pub enum FilenameComparison {
     CaseSensitive,
     CaseInsensitive,
+    NormalizationInsensitive,
+    CaseAndNormalizationInsensitive,
 }
 
 #[derive(Debug)]
@@ -129,7 +131,9 @@ fn validate(value: &str) -> Result<(), PathError> {
 fn comparison_key(value: &str, comparison: FilenameComparison) -> String {
     match comparison {
         FilenameComparison::CaseSensitive => value.to_owned(),
-        FilenameComparison::CaseInsensitive => {
+        FilenameComparison::CaseInsensitive => value.to_lowercase(),
+        FilenameComparison::NormalizationInsensitive => value.nfd().collect::<String>(),
+        FilenameComparison::CaseAndNormalizationInsensitive => {
             value.nfd().flat_map(char::to_lowercase).collect::<String>()
         }
     }
@@ -173,7 +177,7 @@ mod tests {
 
     #[test]
     fn detects_case_and_normalization_collisions_when_required() {
-        let mut index = LocalPathIndex::new(FilenameComparison::CaseInsensitive);
+        let mut index = LocalPathIndex::new(FilenameComparison::CaseAndNormalizationInsensitive);
         index
             .insert(ProtocolPath::parse("Skill/Caf\u{e9}.md").unwrap())
             .unwrap();
@@ -189,5 +193,14 @@ mod tests {
         sensitive
             .insert(ProtocolPath::parse("skill.md").unwrap())
             .unwrap();
+
+        let mut normalized = LocalPathIndex::new(FilenameComparison::NormalizationInsensitive);
+        normalized
+            .insert(ProtocolPath::parse("Caf\u{e9}.md").unwrap())
+            .unwrap();
+        assert!(matches!(
+            normalized.insert(ProtocolPath::parse("Cafe\u{301}.md").unwrap()),
+            Err(PathError::Collision { .. })
+        ));
     }
 }
