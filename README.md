@@ -325,6 +325,9 @@ preset = "n0"
 interval = "15m"
 max_future_clock_skew = "5m"
 ignore = ["**/.git/**", "**/.DS_Store", "**/*.swp"]
+
+[logging]
+max_entries = 1000
 ```
 
 The `n0` preset uses iroh's hosted address lookup and public relays. Custom

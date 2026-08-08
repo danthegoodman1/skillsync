@@ -93,13 +93,13 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | P1.1: Create the two-crate Rust workspace and CI targets | Missing: root `Cargo.toml`, both crate manifests, lockfile, and CI run. |
-| Incomplete | Work | P1.2: Implement configuration, platform paths, and persistent identities | Missing: native modules and identity restart tests. |
-| Incomplete | Work | P1.3: Implement canonical records and deterministic LWW comparison | Missing: canonical encoding code and ordering test matrix. |
-| Incomplete | Work | P1.4: Implement signed roster revision validation and branch selection | Missing: signature, stale-parent, and competing-child tests. |
-| Incomplete | Work | P1.5: Implement SQLite schema and transactional access | Missing: migrations and real-database restart tests. |
-| Incomplete | Test | Phase 1 deterministic and persistence test plan | Missing: passing native test suite and Worker Wasm build. |
-| Incomplete | Gate | Phase 1 completion gate | Missing: CI evidence across macOS, Linux, and Wasm. |
+| Complete | Work | P1.1: Create the two-crate Rust workspace and CI targets | `Cargo.toml`, both crate manifests, `Cargo.lock`, and `.github/workflows/ci.yml`. |
+| Complete | Work | P1.2: Implement configuration, platform paths, and persistent identities | `config.rs` and `identity.rs`, including redaction, permission, and restart tests. |
+| Complete | Work | P1.3: Implement canonical records and deterministic LWW comparison | `canonical.rs` and `record.rs`, including total-order and permutation-independent manifest tests. |
+| Complete | Work | P1.4: Implement signed roster revision validation and branch selection | `roster.rs` and `state.rs`, including signature, stale-parent, removal-priority, insertion-order, and reopen tests. |
+| Complete | Work | P1.5: Implement SQLite schema and transactional access | `state.rs` migration, rollback, winner, roster reconstruction, log retention, and reopen tests. |
+| Complete | Test | Phase 1 deterministic and persistence test plan | `cargo test --workspace --locked` passes 34 tests, strict Clippy passes, and the Worker Wasm check passes. |
+| In Progress | Gate | Phase 1 completion gate | Local macOS and Wasm gates pass. Needs: post-push Ubuntu and macOS CI evidence. |
 
 ## Phase 2: Local Filesystem and Daemon
 
