@@ -2,9 +2,9 @@
 
 ## Overarching Goal
 
-Build the finished experience in [README.md](README.md) as a small Rust system:
-one native `skillsync` binary for macOS and Linux, plus one Rust Cloudflare
-Worker for the joining service. The implementation follows the guarantees in
+Build the finished experience in [README.md](README.md) as one native Rust
+`skillsync` binary for macOS and Linux plus one TypeScript Cloudflare Worker
+for the joining service. The implementation follows the guarantees in
 [ARCHITECTURE.md](ARCHITECTURE.md) and the HTTP contract in
 [JOINING_SERVICE.md](JOINING_SERVICE.md).
 
@@ -15,11 +15,13 @@ supports the two joining endpoints.
 
 ## Implementation Principles
 
-- Use a Cargo workspace with two deployable crates: `skillsync` and
-  `joining-service`. Keep native modules inside `skillsync` unless a real
-  compilation boundary requires another crate.
+- Keep the native binary in the Cargo workspace and the joining service in a
+  small TypeScript Worker package. Keep native modules inside `skillsync`
+  unless a real compilation boundary requires another crate.
 - Add dependencies with `cargo add` and inspect `Cargo.toml` and `Cargo.lock`
   after every addition.
+- Add Worker dependencies with the package manager and keep its lockfile in
+  sync.
 - Use one iroh endpoint and raw QUIC streams under `skillsync/1`.
 - Keep one winning SQLite record per collection path and exchange complete
   manifests.
@@ -36,7 +38,8 @@ supports the two joining endpoints.
 
 ## Testing Strategy
 
-- Run formatting, linting, native tests, and the Worker Wasm build in CI.
+- Run Rust formatting, linting, and native tests plus TypeScript Worker checks
+  in CI.
 - Use table-driven and permutation tests for every deterministic merge or
   ordering rule.
 - Use temporary directories and real SQLite databases for filesystem and
@@ -56,8 +59,8 @@ all later I/O depends on.
 
 Scope:
 
-- Create the Cargo workspace, native binary crate, Worker crate, CI, and basic
-  command entrypoint.
+- Create the Cargo workspace, native binary crate, native CI, and basic command
+  entrypoint.
 - Define configuration loading, platform paths, persistent device identity,
   group identity, operating-system secret storage, and the owner-only file
   fallback.
@@ -74,9 +77,9 @@ Out of scope:
   registration.
 
 Completion gate:
-The workspace builds on macOS, Linux, and `wasm32-unknown-unknown`. Fresh and
-migrated databases reopen without changing state, and every deterministic rule
-produces the same result under input reordering.
+The native workspace builds on macOS and Linux. Fresh and migrated databases
+reopen without changing state, and every deterministic rule produces the same
+result under input reordering.
 
 Testing plan:
 
@@ -93,13 +96,13 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Complete | Work | P1.1: Create the two-crate Rust workspace and CI targets | `Cargo.toml`, both crate manifests, `Cargo.lock`, and `.github/workflows/ci.yml`. |
+| Complete | Work | P1.1: Create the native Rust workspace and CI targets | `Cargo.toml`, the native crate manifest, `Cargo.lock`, and `.github/workflows/ci.yml`. |
 | Complete | Work | P1.2: Implement configuration, platform paths, and persistent identities | `config.rs` and `identity.rs`, including redaction, permission, and restart tests. |
 | Complete | Work | P1.3: Implement canonical records and deterministic LWW comparison | `canonical.rs` and `record.rs`, including total-order and permutation-independent manifest tests. |
 | Complete | Work | P1.4: Implement signed roster revision validation and branch selection | `roster.rs` and `state.rs`, including signature, stale-parent, removal-priority, insertion-order, and reopen tests. |
 | Complete | Work | P1.5: Implement SQLite schema and transactional access | `state.rs` migration, rollback, winner, roster reconstruction, log retention, and reopen tests. |
-| Complete | Test | Phase 1 deterministic and persistence test plan | `cargo test --workspace --locked` passes 34 tests, strict Clippy passes, and the Worker Wasm check passes. |
-| Complete | Gate | Phase 1 completion gate | Local gates pass and [CI run 31274704319](https://github.com/danthegoodman1/skillsync/actions/runs/31274704319) passes Ubuntu, macOS, and Worker Wasm jobs. |
+| Complete | Test | Phase 1 deterministic and persistence test plan | `cargo test --workspace --locked` passes 34 tests and strict Clippy passes. |
+| Complete | Gate | Phase 1 completion gate | Local gates pass and [CI run 31274704319](https://github.com/danthegoodman1/skillsync/actions/runs/31274704319) passes Ubuntu and macOS jobs. |
 
 ## Phase 2: Local Filesystem and Daemon
 
@@ -149,8 +152,8 @@ Status ledger:
 | Complete | Work | P2.3: Implement watch events, tombstones, full scans, and clock checks | `daemon.rs` uses bounded polling watchers plus startup and periodic scans, with deletion, dropped-watch repair, future-time rejection, and degraded-state tests. |
 | Complete | Work | P2.4: Implement validated atomic file installation and repair state | `installer.rs` validates bytes and metadata before rename, synchronizes directories, binds the acquired physical root transactionally, and passes fault and ABA tests. |
 | Complete | Work | P2.5: Implement daemon socket and local CLI commands | The private bounded Unix socket and setup, status, collections, config, and logs commands pass the real-process CLI and daemon test. |
-| Complete | Test | Phase 2 filesystem and restart test plan | Locked tests pass 70 unit tests plus one real-process integration test, strict Clippy, formatting, and the Worker Wasm check. |
-| Complete | Gate | Phase 2 completion gate | Local gates pass and [CI run 31279534675](https://github.com/danthegoodman1/skillsync/actions/runs/31279534675) passes Ubuntu, macOS, and Worker Wasm jobs. |
+| Complete | Test | Phase 2 filesystem and restart test plan | Locked tests pass 70 unit tests plus one real-process integration test, strict Clippy, and formatting. |
+| Complete | Gate | Phase 2 completion gate | Local gates pass and [CI run 31279534675](https://github.com/danthegoodman1/skillsync/actions/runs/31279534675) passes Ubuntu and macOS jobs. |
 
 ## Phase 3: Direct Peer Synchronization
 
@@ -261,16 +264,18 @@ Status ledger:
 | Incomplete | Test | Phase 4 membership and joining test plan | Missing: passing branch, rejection, retry, and terminal interaction suites. |
 | Incomplete | Gate | Phase 4 completion gate | Missing: repeatable three-device joining and removal artifact. |
 
-## Phase 5: Rust Joining Service
+## Phase 5: TypeScript Joining Service
 
 Goal:
-Provide the two-endpoint joining contract as a self-hostable Rust Cloudflare
-Worker and operate the default service at `skillsync.danthegoodman.com`.
+Provide the two-endpoint joining contract as a self-hostable TypeScript
+Cloudflare Worker and operate the default service at
+`skillsync.danthegoodman.com`.
 
 Scope:
 
-- Implement the Worker request router, validation, response shapes, body limit,
-  TTL limit, uniform unavailable-code response, and log redaction.
+- Create a small TypeScript Worker package with Wrangler, then implement the
+  request router, validation, response shapes, body limit, TTL limit, uniform
+  unavailable-code response, and log redaction.
 - Implement one named `JoinCoordinator` Durable Object for reservation, expiry,
   one-time claim, and idempotent retries.
 - Generate managed-service codes as two independently selected words from the
@@ -291,8 +296,8 @@ idempotency, body-limit, and redaction smoke tests.
 
 Testing plan:
 
-- Handler tests for accepted fields, validation boundaries, opaque codes,
-  uniform unavailable responses, and safe headers.
+- TypeScript handler tests for accepted fields, validation boundaries, opaque
+  codes, uniform unavailable responses, and safe headers.
 - Concurrent tests proving exactly one claim succeeds and an idempotent retry
   returns its original result.
 - Durable Object restart tests proving active invitations and idempotency state
@@ -303,7 +308,7 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | P5.1: Implement the Rust Worker router and validation | Missing: Worker handlers and HTTP contract tests. |
+| Incomplete | Work | P5.1: Implement the TypeScript Worker router and validation | Missing: Worker package, handlers, and HTTP contract tests. |
 | Incomplete | Work | P5.2: Implement atomic invitation state in `JoinCoordinator` | Missing: Durable Object code and concurrent-claim tests. |
 | Incomplete | Work | P5.3: Implement hosted code generation, expiry, idempotency, and limits | Missing: deterministic boundary and abuse-limit tests. |
 | Incomplete | Work | P5.4: Add local and managed deployment configuration | Missing: Wrangler configuration and documented commands. |
