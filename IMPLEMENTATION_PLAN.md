@@ -149,8 +149,8 @@ Status ledger:
 | Complete | Work | P2.3: Implement watch events, tombstones, full scans, and clock checks | `daemon.rs` uses bounded polling watchers plus startup and periodic scans, with deletion, dropped-watch repair, future-time rejection, and degraded-state tests. |
 | Complete | Work | P2.4: Implement validated atomic file installation and repair state | `installer.rs` validates bytes and metadata before rename, synchronizes directories, binds the acquired physical root transactionally, and passes fault and ABA tests. |
 | Complete | Work | P2.5: Implement daemon socket and local CLI commands | The private bounded Unix socket and setup, status, collections, config, and logs commands pass the real-process CLI and daemon test. |
-| Complete | Test | Phase 2 filesystem and restart test plan | Local locked tests pass 69 unit tests plus one real-process integration test, strict Clippy, formatting, and the Worker Wasm check. |
-| In Progress | Gate | Phase 2 completion gate | Local edit, delete, watch, periodic repair, restart, symlink, race, and atomic-install evidence passes. Linux and macOS CI are pending the phase push. |
+| Complete | Test | Phase 2 filesystem and restart test plan | Locked tests pass 70 unit tests plus one real-process integration test, strict Clippy, formatting, and the Worker Wasm check. |
+| Complete | Gate | Phase 2 completion gate | Local gates pass and [CI run 31279534675](https://github.com/danthegoodman1/skillsync/actions/runs/31279534675) passes Ubuntu, macOS, and Worker Wasm jobs. |
 
 ## Phase 3: Direct Peer Synchronization
 
