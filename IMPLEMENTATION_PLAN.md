@@ -99,7 +99,7 @@ Status ledger:
 | Complete | Work | P1.4: Implement signed roster revision validation and branch selection | `roster.rs` and `state.rs`, including signature, stale-parent, removal-priority, insertion-order, and reopen tests. |
 | Complete | Work | P1.5: Implement SQLite schema and transactional access | `state.rs` migration, rollback, winner, roster reconstruction, log retention, and reopen tests. |
 | Complete | Test | Phase 1 deterministic and persistence test plan | `cargo test --workspace --locked` passes 34 tests, strict Clippy passes, and the Worker Wasm check passes. |
-| In Progress | Gate | Phase 1 completion gate | Local macOS and Wasm gates pass. Needs: post-push Ubuntu and macOS CI evidence. |
+| Complete | Gate | Phase 1 completion gate | Local gates pass and [CI run 31274704319](https://github.com/danthegoodman1/skillsync/actions/runs/31274704319) passes Ubuntu, macOS, and Worker Wasm jobs. |
 
 ## Phase 2: Local Filesystem and Daemon
 
