@@ -187,7 +187,7 @@ pub fn install_file_with_hook(
         };
         if let Err(source) = hook(InstallStage::AfterRename).and_then(|()| {
             let parent = open_relative_dir(&root_dir, parent_relative)?;
-            parent.into_std_file().sync_all()
+            sync_dir(&parent)
         }) {
             return Err(InstallError::PostRenameDurability {
                 installed: Box::new(installed),
@@ -336,7 +336,10 @@ fn ensure_safe_parent(
 }
 
 fn sync_dir(directory: &Dir) -> io::Result<()> {
-    directory.try_clone()?.into_std_file().sync_all()
+    // A cap-std traversal descriptor may be O_PATH on Linux and cannot be
+    // fsynced. Opening `.` relative to it preserves the directory identity
+    // while obtaining a read descriptor that supports fsync.
+    directory.open(".")?.sync_all()
 }
 
 fn temporary_name(root: &Dir) -> Result<PathBuf, InstallError> {
@@ -631,6 +634,15 @@ mod tests {
         );
         assert!(matches!(result, Err(InstallError::Io(_))));
         assert!(!temporary.path().join("new/ancestor/SKILL.md").exists());
+    }
+
+    #[test]
+    fn directory_durability_uses_an_fsync_capable_relative_handle() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory =
+            Dir::open_ambient_dir(temporary.path(), cap_std::ambient_authority()).unwrap();
+
+        sync_dir(&directory).unwrap();
     }
 
     #[test]
