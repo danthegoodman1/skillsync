@@ -22,7 +22,8 @@ supports the two joining endpoints.
   after every addition.
 - Add Worker dependencies with the package manager and keep its lockfile in
   sync.
-- Use one iroh endpoint and raw QUIC streams under `skillsync/1`.
+- Use one iroh endpoint with raw QUIC streams under `skillsync/1` for sync and
+  `skillsync-join/1` for admission.
 - Keep one winning SQLite record per collection path and exchange complete
   manifests.
 - Make record comparison, roster selection, path validation, and protocol
@@ -256,13 +257,13 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | P4.1: Implement roster admission, removal, conflict selection, and retry | Missing: roster mutation code and concurrent-branch tests. |
-| Incomplete | Work | P4.2: Implement peer listing, removal, and connection refusal | Missing: CLI and removed-peer integration tests. |
-| Incomplete | Work | P4.3: Implement the bounded joining-service HTTP client | Missing: client module and contract fixture tests. |
-| Incomplete | Work | P4.4: Implement invite, nonce proof, identity confirmation, and join | Missing: interactive and three-process end-to-end tests. |
-| Incomplete | Work | P4.5: Implement roster discovery through one member | Missing: three-peer discovery and synchronization evidence. |
-| Incomplete | Test | Phase 4 membership and joining test plan | Missing: passing branch, rejection, retry, and terminal interaction suites. |
-| Incomplete | Gate | Phase 4 completion gate | Missing: repeatable three-device joining and removal artifact. |
+| Complete | Work | P4.1: Implement roster admission, removal, conflict selection, and retry | Signed mutations replay losing local changes from the selected parent and propagate selected-tip changes. |
+| Complete | Work | P4.2: Implement peer listing, removal, and connection refusal | Human and JSON peer commands are implemented, and current peers refuse stale removed identities. |
+| Complete | Work | P4.3: Implement the bounded joining-service HTTP client | The redirect-free client enforces URL, header, body, TTL, timeout, retry, idempotency, response, and redaction bounds. |
+| Complete | Work | P4.4: Implement invite, nonce proof, identity confirmation, and join | One persistent endpoint handles bounded join sessions with nonce proof, exact EndpointID approval, default rejection, and resumable delivery. |
+| Complete | Work | P4.5: Implement roster discovery through one member | A joiner receives the complete selected roster and peer hints, attaches defaults, and synchronizes immediately. |
+| Complete | Test | Phase 4 membership and joining test plan | 133 local tests cover roster branches, client failures, terminal safety, process locking, three-device joining, removal, and stale-peer refusal. |
+| In Progress | Gate | Phase 4 completion gate | Implementation and skeptical review are approved. Ubuntu and macOS CI are pending for the pushed phase commit. |
 
 ## Phase 5: TypeScript Joining Service
 

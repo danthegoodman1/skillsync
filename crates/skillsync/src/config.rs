@@ -130,7 +130,7 @@ impl fmt::Debug for JoiningConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("JoiningConfig")
-            .field("service_url", &self.service_url)
+            .field("service_url", &"[configured]")
             .field("invitation_ttl", &self.invitation_ttl)
             .field("headers", &self.headers)
             .finish()
@@ -302,6 +302,8 @@ pub enum ConfigError {
 mod tests {
     use super::*;
 
+    static ENVIRONMENT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn defaults_match_the_product_contract() {
         let config = Config::default();
@@ -371,6 +373,32 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let config = Config::load(&temporary.path().join("missing.toml")).unwrap();
         assert_eq!(config.sync.interval, Duration::from_secs(900));
+    }
+
+    #[test]
+    fn joining_service_environment_override_has_precedence() {
+        let _guard = ENVIRONMENT_LOCK.lock().unwrap();
+        let previous = env::var_os("SKILLSYNC_JOINING_SERVICE_URL");
+        // SAFETY: this test serializes all mutation of this process variable.
+        unsafe {
+            env::set_var(
+                "SKILLSYNC_JOINING_SERVICE_URL",
+                "https://environment.example.test",
+            );
+        }
+        let mut config = Config::default();
+        config.joining.service_url = "https://config.example.test".to_owned();
+        assert_eq!(
+            config.effective_joining_service_url(),
+            "https://environment.example.test"
+        );
+        // SAFETY: the same process-wide lock remains held while restoring the variable.
+        unsafe {
+            match previous {
+                Some(value) => env::set_var("SKILLSYNC_JOINING_SERVICE_URL", value),
+                None => env::remove_var("SKILLSYNC_JOINING_SERVICE_URL"),
+            }
+        }
     }
 
     #[test]

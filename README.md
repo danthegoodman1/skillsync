@@ -258,7 +258,7 @@ as a synchronized write.
 | `skillsync enable` | Register the daemon for boot or login and start it now |
 | `skillsync disable` | Unregister startup and stop the daemon |
 | `skillsync invite` | Create a short-lived joining code |
-| `skillsync join <code>` | Join an existing group |
+| `skillsync join <code> --name <name>` | Join an existing group |
 | `skillsync status` | Show daemon, peer, and synchronization health |
 | `skillsync sync [--wait]` | Synchronize with reachable peers now |
 | `skillsync collections list` | Show local collections and paths |

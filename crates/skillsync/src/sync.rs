@@ -62,6 +62,21 @@ pub async fn run_session(
     side: ConnectionSide,
     config: SessionConfig,
 ) -> Result<EndpointId, SyncError> {
+    Ok(run_session_with_outcome(connection, side, config)
+        .await?
+        .remote_endpoint)
+}
+
+pub(crate) struct SessionOutcome {
+    pub remote_endpoint: EndpointId,
+    pub roster_changed: bool,
+}
+
+pub(crate) async fn run_session_with_outcome(
+    connection: Connection,
+    side: ConnectionSide,
+    config: SessionConfig,
+) -> Result<SessionOutcome, SyncError> {
     let remote_endpoint = endpoint_from_iroh(connection.remote_id());
     authorize_local_roster(&config.database, config.local_endpoint, remote_endpoint)?;
 
@@ -139,7 +154,7 @@ pub async fn run_session(
     {
         return Err(SyncError::RosterDigestMismatch);
     }
-    merge_and_authorize_remote_roster(
+    let roster_changed = merge_and_authorize_remote_roster(
         &config.database,
         &remote_roster.revisions,
         config.local_endpoint,
@@ -256,7 +271,10 @@ pub async fn run_session(
     {
         return Err(SyncError::Transport);
     }
-    Ok(remote_endpoint)
+    Ok(SessionOutcome {
+        remote_endpoint,
+        roster_changed,
+    })
 }
 
 fn authorize_local_roster(
@@ -293,19 +311,53 @@ fn merge_and_authorize_remote_roster(
     local_endpoint: EndpointId,
     remote_endpoint: EndpointId,
     remote_name: &str,
-) -> Result<(), SyncError> {
+) -> Result<bool, SyncError> {
     let mut state = StateStore::open(database)?;
+    let previous = state.selected_roster_chain()?;
+    let previous_tip = previous.last().map(|revision| revision.canonical_hash());
     state.merge_selected_roster_chain(revisions)?;
+    let selected_after_merge = state.selected_roster_chain()?;
+    let selected_hashes = selected_after_merge
+        .iter()
+        .map(|revision| revision.canonical_hash())
+        .collect::<BTreeSet<_>>();
+    if previous
+        .last()
+        .is_some_and(|tip| !selected_hashes.contains(&tip.canonical_hash()))
+    {
+        let data_dir = database.parent().ok_or(SyncError::MissingRoster)?;
+        let identity = crate::setup::load_identity_from_data_dir(data_dir)
+            .map_err(|_| SyncError::MissingRoster)?;
+        for revision in previous
+            .iter()
+            .filter(|revision| !selected_hashes.contains(&revision.canonical_hash()))
+            .filter(|revision| revision.author() == local_endpoint)
+        {
+            if !state
+                .selected_roster_chain()?
+                .last()
+                .is_some_and(|tip| tip.members().contains_key(&local_endpoint))
+            {
+                break;
+            }
+            state.apply_roster_change(&identity, revision.change().clone())?;
+        }
+    }
     let selected = state.selected_roster_chain()?;
     let tip = selected.last().ok_or(SyncError::MissingRoster)?;
+    let roster_changed = previous_tip != Some(tip.canonical_hash());
     if !tip.members().contains_key(&local_endpoint) || !tip.members().contains_key(&remote_endpoint)
     {
-        return Err(SyncError::UnauthorizedPeer);
+        return Err(if roster_changed {
+            SyncError::RosterChangedAndUnauthorizedPeer
+        } else {
+            SyncError::UnauthorizedPeer
+        });
     }
     if tip.members().get(&remote_endpoint).map(String::as_str) != Some(remote_name) {
         return Err(SyncError::DeviceNameMismatch);
     }
-    Ok(())
+    Ok(roster_changed)
 }
 
 fn persist_remote_hint(
@@ -788,6 +840,8 @@ pub enum SyncError {
     MissingRoster,
     #[error("peer is not an active roster member")]
     UnauthorizedPeer,
+    #[error("roster changed and the connected peer is no longer active")]
+    RosterChangedAndUnauthorizedPeer,
     #[error("peer belongs to a different group")]
     WrongGroup,
     #[error("peer roster digest does not match the exchanged roster")]
@@ -812,6 +866,8 @@ pub enum SyncError {
     UnexpectedState,
     #[error("EndpointID is not a valid iroh public key")]
     InvalidEndpoint,
+    #[error("joining session was rejected")]
+    JoinRejected,
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
     #[error(transparent)]
@@ -906,6 +962,303 @@ mod tests {
             "remote",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn roster_merge_retries_a_losing_local_mutation_from_the_selected_parent() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let local = DeviceIdentity::from_secret([31; 32]);
+        let first = DeviceIdentity::from_secret([32; 32]);
+        let second = DeviceIdentity::from_secret([33; 32]);
+        let genesis =
+            RosterRevision::genesis(GroupId::from_bytes([4; 32]), "local", &local).unwrap();
+        let first_change =
+            RosterChange::Admit(RosterMember::new(first.endpoint_id(), "first").unwrap());
+        let second_change =
+            RosterChange::Admit(RosterMember::new(second.endpoint_id(), "second").unwrap());
+        let first_child = RosterRevision::child(&genesis, first_change.clone(), &local).unwrap();
+        let second_child = RosterRevision::child(&genesis, second_change.clone(), &local).unwrap();
+        let (loser, winner, remote_endpoint, remote_name) =
+            if first_child.canonical_hash() < second_child.canonical_hash() {
+                (first_child, second_child, second.endpoint_id(), "second")
+            } else {
+                (second_child, first_child, first.endpoint_id(), "first")
+            };
+        let temporary = tempfile::tempdir().unwrap();
+        let database = temporary.path().join("state.sqlite3");
+        fs::write(temporary.path().join("identity.key"), local.secret_bytes()).unwrap();
+        fs::set_permissions(
+            temporary.path().join("identity.key"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        fs::write(
+            temporary.path().join("identity.ref"),
+            b"file\nidentity.key\n",
+        )
+        .unwrap();
+        fs::set_permissions(
+            temporary.path().join("identity.ref"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let mut state = StateStore::open(&database).unwrap();
+        state.insert_roster_revision(&genesis).unwrap();
+        state.insert_roster_revision(&loser).unwrap();
+        drop(state);
+
+        assert!(
+            merge_and_authorize_remote_roster(
+                &database,
+                &[genesis.clone(), winner.clone()],
+                local.endpoint_id(),
+                remote_endpoint,
+                remote_name,
+            )
+            .unwrap()
+        );
+        let state = StateStore::open(&database).unwrap();
+        let selected = state.selected_roster_chain().unwrap();
+        assert_eq!(selected.len(), 3);
+        assert_eq!(selected[1].canonical_hash(), winner.canonical_hash());
+        assert!(
+            selected
+                .last()
+                .unwrap()
+                .members()
+                .contains_key(&first.endpoint_id())
+        );
+        assert!(
+            selected
+                .last()
+                .unwrap()
+                .members()
+                .contains_key(&second.endpoint_id())
+        );
+    }
+
+    #[test]
+    fn competing_names_for_one_endpoint_converge_across_sync_and_reopen() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let local = DeviceIdentity::from_secret([35; 32]);
+        let joining = DeviceIdentity::from_secret([36; 32]);
+        let genesis =
+            RosterRevision::genesis(GroupId::from_bytes([37; 32]), "local", &local).unwrap();
+        let first = RosterRevision::child(
+            &genesis,
+            RosterChange::Admit(RosterMember::new(joining.endpoint_id(), "first").unwrap()),
+            &local,
+        )
+        .unwrap();
+        let second = RosterRevision::child(
+            &genesis,
+            RosterChange::Admit(RosterMember::new(joining.endpoint_id(), "second").unwrap()),
+            &local,
+        )
+        .unwrap();
+        let (loser, winner) = if first.canonical_hash() < second.canonical_hash() {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let selected_name = winner
+            .members()
+            .get(&joining.endpoint_id())
+            .unwrap()
+            .clone();
+        let temporary = tempfile::tempdir().unwrap();
+        let database = temporary.path().join("state.sqlite3");
+        fs::write(temporary.path().join("identity.key"), local.secret_bytes()).unwrap();
+        fs::set_permissions(
+            temporary.path().join("identity.key"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        fs::write(
+            temporary.path().join("identity.ref"),
+            b"file\nidentity.key\n",
+        )
+        .unwrap();
+        fs::set_permissions(
+            temporary.path().join("identity.ref"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let mut state = StateStore::open(&database).unwrap();
+        state.insert_roster_revision(&genesis).unwrap();
+        state.insert_roster_revision(&loser).unwrap();
+        drop(state);
+
+        assert!(
+            merge_and_authorize_remote_roster(
+                &database,
+                &[genesis.clone(), winner.clone()],
+                local.endpoint_id(),
+                joining.endpoint_id(),
+                &selected_name,
+            )
+            .unwrap()
+        );
+        assert!(
+            !merge_and_authorize_remote_roster(
+                &database,
+                &[genesis, winner],
+                local.endpoint_id(),
+                joining.endpoint_id(),
+                &selected_name,
+            )
+            .unwrap()
+        );
+        let reopened = StateStore::open(&database).unwrap();
+        let selected = reopened.selected_roster_chain().unwrap();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(
+            selected
+                .last()
+                .unwrap()
+                .members()
+                .get(&joining.endpoint_id()),
+            Some(&selected_name)
+        );
+    }
+
+    #[test]
+    fn remote_only_three_member_roster_change_requests_followup_reconciliation() {
+        let local = DeviceIdentity::from_secret([41; 32]);
+        let remote = DeviceIdentity::from_secret([42; 32]);
+        let third = DeviceIdentity::from_secret([43; 32]);
+        let genesis =
+            RosterRevision::genesis(GroupId::from_bytes([44; 32]), "local", &local).unwrap();
+        let parent = RosterRevision::child(
+            &genesis,
+            RosterChange::Admit(RosterMember::new(remote.endpoint_id(), "remote").unwrap()),
+            &local,
+        )
+        .unwrap();
+        let update = RosterRevision::child(
+            &parent,
+            RosterChange::Admit(RosterMember::new(third.endpoint_id(), "third").unwrap()),
+            &remote,
+        )
+        .unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let database = temporary.path().join("state.sqlite3");
+        let mut state = StateStore::open(&database).unwrap();
+        state.insert_roster_revision(&genesis).unwrap();
+        state.insert_roster_revision(&parent).unwrap();
+        drop(state);
+
+        assert!(
+            merge_and_authorize_remote_roster(
+                &database,
+                &[genesis.clone(), parent.clone(), update.clone()],
+                local.endpoint_id(),
+                remote.endpoint_id(),
+                "remote",
+            )
+            .unwrap()
+        );
+        assert!(
+            !merge_and_authorize_remote_roster(
+                &database,
+                &[genesis, parent, update],
+                local.endpoint_id(),
+                remote.endpoint_id(),
+                "remote",
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn replay_that_removes_the_connected_peer_requests_followup_before_rejection() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let local = DeviceIdentity::from_secret([51; 32]);
+        let remote = DeviceIdentity::from_secret([52; 32]);
+        let replayed_member = DeviceIdentity::from_secret([53; 32]);
+        let genesis =
+            RosterRevision::genesis(GroupId::from_bytes([54; 32]), "local", &local).unwrap();
+        let parent = RosterRevision::child(
+            &genesis,
+            RosterChange::Admit(RosterMember::new(remote.endpoint_id(), "remote").unwrap()),
+            &local,
+        )
+        .unwrap();
+        let local_admission = RosterRevision::child(
+            &parent,
+            RosterChange::Admit(
+                RosterMember::new(replayed_member.endpoint_id(), "replayed").unwrap(),
+            ),
+            &local,
+        )
+        .unwrap();
+        let local_removal = RosterRevision::child(
+            &local_admission,
+            RosterChange::Remove(remote.endpoint_id()),
+            &local,
+        )
+        .unwrap();
+        let (remote_winner, remote_member) = (60_u8..=u8::MAX)
+            .find_map(|seed| {
+                let candidate = DeviceIdentity::from_secret([seed; 32]);
+                let revision = RosterRevision::child(
+                    &parent,
+                    RosterChange::Admit(
+                        RosterMember::new(candidate.endpoint_id(), "remote-winner").unwrap(),
+                    ),
+                    &remote,
+                )
+                .unwrap();
+                (revision.canonical_hash() > local_admission.canonical_hash())
+                    .then_some((revision, candidate))
+            })
+            .expect("a greater competing admission hash exists");
+        let temporary = tempfile::tempdir().unwrap();
+        let database = temporary.path().join("state.sqlite3");
+        fs::write(temporary.path().join("identity.key"), local.secret_bytes()).unwrap();
+        fs::set_permissions(
+            temporary.path().join("identity.key"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        fs::write(
+            temporary.path().join("identity.ref"),
+            b"file\nidentity.key\n",
+        )
+        .unwrap();
+        fs::set_permissions(
+            temporary.path().join("identity.ref"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let mut state = StateStore::open(&database).unwrap();
+        for revision in [&genesis, &parent, &local_admission, &local_removal] {
+            state.insert_roster_revision(revision).unwrap();
+        }
+        drop(state);
+
+        assert!(matches!(
+            merge_and_authorize_remote_roster(
+                &database,
+                &[genesis, parent, remote_winner],
+                local.endpoint_id(),
+                remote.endpoint_id(),
+                "remote",
+            ),
+            Err(SyncError::RosterChangedAndUnauthorizedPeer)
+        ));
+        let state = StateStore::open(&database).unwrap();
+        let selected = state.selected_roster_chain().unwrap();
+        let tip = selected.last().unwrap();
+        assert!(!tip.members().contains_key(&remote.endpoint_id()));
+        assert!(tip.members().contains_key(&replayed_member.endpoint_id()));
+        assert!(tip.members().contains_key(&remote_member.endpoint_id()));
     }
 
     #[test]

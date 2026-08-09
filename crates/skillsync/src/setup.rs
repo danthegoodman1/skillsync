@@ -40,14 +40,62 @@ pub fn setup(paths: &PlatformPaths, config: &Config) -> Result<SetupResult, Setu
         state.insert_roster_revision(&genesis)?;
     }
 
+    let collections = attach_default_collections(&mut state, config)?;
+
+    let device_name = state
+        .selected_roster_chain()?
+        .last()
+        .and_then(|revision| revision.members().get(&identity.endpoint_id()))
+        .cloned()
+        .unwrap_or_else(|| config.device.name.clone());
+    Ok(SetupResult {
+        device_name,
+        endpoint_id: identity.endpoint_id(),
+        collections,
+        created,
+    })
+}
+
+pub fn setup_joining_device(
+    paths: &PlatformPaths,
+    config: &Config,
+) -> Result<SetupResult, SetupError> {
+    config.validate()?;
+    fs::create_dir_all(&paths.data_dir)?;
+    fs::create_dir_all(&paths.runtime_dir)?;
+    let (identity, reference) = IdentityStore::new(paths).load_or_create()?;
+    let database = paths.data_dir.join("state.sqlite3");
+    let mut state = StateStore::open(&database)?;
+    let existing_roster = state.selected_roster_chain()?;
+    let existing_name = existing_roster
+        .last()
+        .and_then(|tip| tip.members().get(&identity.endpoint_id()))
+        .cloned();
+    if !existing_roster.is_empty() && existing_name.is_none() {
+        return Err(SetupError::LocalDeviceRemoved);
+    }
+    state.save_identity_reference("device", &reference)?;
+    let collections = attach_default_collections(&mut state, config)?;
+    Ok(SetupResult {
+        device_name: existing_name
+            .clone()
+            .unwrap_or_else(|| config.device.name.clone()),
+        endpoint_id: identity.endpoint_id(),
+        collections,
+        created: existing_name.is_none(),
+    })
+}
+
+fn attach_default_collections(
+    state: &mut StateStore,
+    config: &Config,
+) -> Result<Vec<(String, PathBuf)>, SetupError> {
     let home = env::var_os("HOME").ok_or(SetupError::MissingHome)?;
     let mut collections = Vec::new();
     for (name, relative) in DEFAULT_COLLECTIONS {
         let local_path = Path::new(&home).join(relative);
         match state.collection(name)? {
-            Some(existing) => {
-                collections.push((name.to_owned(), existing.local_path));
-            }
+            Some(existing) => collections.push((name.to_owned(), existing.local_path)),
             None => {
                 fs::create_dir_all(&local_path)?;
                 let resolved = fs::canonicalize(&local_path)?;
@@ -63,18 +111,21 @@ pub fn setup(paths: &PlatformPaths, config: &Config) -> Result<SetupResult, Setu
             }
         }
     }
-
-    Ok(SetupResult {
-        device_name: config.device.name.clone(),
-        endpoint_id: identity.endpoint_id(),
-        collections,
-        created,
-    })
+    Ok(collections)
 }
 
 pub fn load_identity(paths: &PlatformPaths) -> Result<DeviceIdentity, SetupError> {
     let (identity, _) = IdentityStore::new(paths).load_or_create()?;
     Ok(identity)
+}
+
+pub fn load_identity_from_data_dir(data_dir: &Path) -> Result<DeviceIdentity, SetupError> {
+    let paths = PlatformPaths {
+        config_file: data_dir.join("unused-config.toml"),
+        data_dir: data_dir.to_path_buf(),
+        runtime_dir: data_dir.join("unused-run"),
+    };
+    load_identity(&paths)
 }
 
 pub fn now_ns() -> i64 {
@@ -100,4 +151,6 @@ pub enum SetupError {
     Roster(#[from] RosterError),
     #[error(transparent)]
     State(#[from] StateError),
+    #[error("this device has been removed from its group")]
+    LocalDeviceRemoved,
 }

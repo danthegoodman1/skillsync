@@ -7,9 +7,16 @@ use serde_json::{Value, json};
 use skillsync::config::{Config, IrohPreset, PlatformPaths};
 use skillsync::daemon::{
     ControlRequest, ControlResponse, DaemonError, attach_collection, collections_value,
-    detach_collection, logs_page_value, send_request, status_value,
+    detach_collection, logs_page_value, peers_value, resolve_peer, send_request, status_value,
 };
-use skillsync::setup::{load_identity, setup};
+use skillsync::join::{
+    SecretNonce, endpoint_ticket, run_joiner, terminal_safe_device_name, validate_join_device_name,
+};
+use skillsync::joining_service::JoiningServiceClient;
+use skillsync::network::NetworkHandle;
+use skillsync::process_lock::ProcessLock;
+use skillsync::roster::RosterChange;
+use skillsync::setup::{load_identity, setup, setup_joining_device};
 use skillsync::state::StateStore;
 
 #[derive(Parser)]
@@ -39,6 +46,16 @@ enum Command {
     },
     Logs(LogsArgs),
     Sync(SyncArgs),
+    Invite,
+    Join {
+        code: String,
+        #[arg(long)]
+        name: String,
+    },
+    Peers {
+        #[command(subcommand)]
+        command: PeersCommand,
+    },
     #[command(name = "__daemon", hide = true)]
     Daemon,
 }
@@ -61,6 +78,12 @@ enum CollectionsCommand {
 enum ConfigCommand {
     Show,
     Path,
+}
+
+#[derive(Subcommand)]
+enum PeersCommand {
+    List,
+    Remove { device: String },
 }
 
 #[derive(Args)]
@@ -103,8 +126,300 @@ fn execute(cli: &Cli) -> Result<(), CliError> {
         Command::Config { command } => command_config(&paths, &config, command, cli.json),
         Command::Logs(arguments) => command_logs(&paths, arguments, cli.json),
         Command::Sync(arguments) => command_sync(&paths, arguments, cli.json),
+        Command::Invite => command_invite(&paths, &config, cli.json),
+        Command::Join { code, name } => command_join(&paths, &config, code, name, cli.json),
+        Command::Peers { command } => command_peers(&paths, &config, command, cli.json),
         Command::Daemon => skillsync::daemon::run(paths, config).map_err(CliError::from_error),
     }
+}
+
+fn command_invite(
+    paths: &PlatformPaths,
+    config: &Config,
+    json_output: bool,
+) -> Result<(), CliError> {
+    let endpoint = send_request(paths, &ControlRequest::EndpointAddr)
+        .map_err(|_| CliError::new("daemon_not_running", "the skillsync daemon is not running"))?;
+    if !endpoint.ok {
+        return Err(response_error(endpoint));
+    }
+    let address = endpoint
+        .result
+        .and_then(|value| value["address"].as_str().map(str::to_owned))
+        .ok_or_else(|| {
+            CliError::new("invalid_daemon_response", "daemon endpoint is unavailable")
+        })?;
+    let address =
+        serde_json::from_str::<iroh::EndpointAddr>(&address).map_err(CliError::from_error)?;
+    let ticket = endpoint_ticket(address);
+    let client = JoiningServiceClient::from_config(config).map_err(CliError::from_error)?;
+    let invitation = client
+        .create(&ticket, config.joining.invitation_ttl)
+        .map_err(CliError::from_error)?;
+    let response = send_request(
+        paths,
+        &ControlRequest::ActivateInvitation {
+            nonce: SecretNonce::new(invitation.join_nonce),
+            lifetime_seconds: config.joining.invitation_ttl.as_secs(),
+        },
+    )
+    .map_err(CliError::from_error)?;
+    if !response.ok {
+        return Err(response_error(response));
+    }
+    if json_output {
+        print_json(&json!({
+            "event": "invitation_created",
+            "code": invitation.code,
+            "expires_at": invitation.expires_at
+        }));
+    } else {
+        println!("Joining code: {}", invitation.code);
+        println!(
+            "Expires in {}.\n",
+            humantime::format_duration(config.joining.invitation_ttl)
+        );
+        println!("Waiting for another device…");
+    }
+    io::stdout().flush().map_err(CliError::from_error)?;
+
+    let deadline = std::time::Instant::now() + config.joining.invitation_ttl;
+    let pending = loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(CliError::new(
+                "invitation_expired",
+                "the invitation expired",
+            ));
+        }
+        let response =
+            send_request(paths, &ControlRequest::PendingJoin).map_err(CliError::from_error)?;
+        if !response.ok {
+            return Err(response_error(response));
+        }
+        let result = response.result.expect("successful response");
+        if !result["pending"].is_null() {
+            break result["pending"].clone();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    let request_id = pending["request_id"]
+        .as_str()
+        .ok_or_else(|| CliError::new("invalid_daemon_response", "join request is invalid"))?;
+    let endpoint_id = pending["endpoint_id"]
+        .as_str()
+        .ok_or_else(|| CliError::new("invalid_daemon_response", "join request is invalid"))?;
+    let device_name = pending["device_name"].as_str().unwrap_or("device");
+    if json_output {
+        print_json(&json!({
+            "event": "join_requested",
+            "device_name": device_name,
+            "endpoint_id": endpoint_id
+        }));
+    } else {
+        println!("{}", join_request_human(device_name, endpoint_id));
+    }
+    let approved = confirm_join()?;
+    let response = send_request(
+        paths,
+        &ControlRequest::DecideJoin {
+            request_id: request_id.to_owned(),
+            approve: approved,
+        },
+    )
+    .map_err(CliError::from_error)?;
+    if !response.ok {
+        return Err(response_error(response));
+    }
+    if json_output {
+        print_json(&json!({
+            "event": "join_decided",
+            "approved": approved,
+            "endpoint_id": endpoint_id
+        }));
+    } else if approved {
+        println!("Device approved.");
+    } else {
+        println!("Device rejected.");
+    }
+    Ok(())
+}
+
+fn join_request_human(device_name: &str, endpoint_id: &str) -> String {
+    format!(
+        "\nJoin request from: {}\nJoining iroh EndpointID:\n{endpoint_id}\n",
+        terminal_safe_device_name(device_name)
+    )
+}
+
+fn confirm_join() -> Result<bool, CliError> {
+    eprint!("Does this exactly match the EndpointID on the joining device? [y/N] ");
+    io::stderr().flush().map_err(CliError::from_error)?;
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(CliError::from_error)?;
+    Ok(approval_answer(&answer))
+}
+
+fn approval_answer(answer: &str) -> bool {
+    matches!(answer.trim(), "y" | "Y" | "yes" | "YES")
+}
+
+fn command_join(
+    paths: &PlatformPaths,
+    config: &Config,
+    code: &str,
+    name: &str,
+    json_output: bool,
+) -> Result<(), CliError> {
+    let _process_lock = ProcessLock::acquire(paths).map_err(CliError::from_error)?;
+    validate_join_device_name(name).map_err(CliError::from_error)?;
+    let setup = setup_joining_device(paths, config).map_err(CliError::from_error)?;
+    if !setup.created && setup.device_name != name {
+        return Err(CliError::new(
+            "device_name_mismatch",
+            "the joining name does not match this device's current group membership",
+        ));
+    }
+    let identity = load_identity(paths).map_err(CliError::from_error)?;
+    if json_output {
+        print_json(&json!({
+            "event": "identity",
+            "endpoint_id": identity.endpoint_id().to_string()
+        }));
+    } else {
+        println!("This device's iroh EndpointID:");
+        println!("{}\n", identity.endpoint_id());
+        println!("Compare this exact EndpointID on the inviting device.");
+        println!("Waiting for approval…");
+    }
+    io::stdout().flush().map_err(CliError::from_error)?;
+    let client = JoiningServiceClient::from_config(config).map_err(CliError::from_error)?;
+    let claimed = client.claim(code).map_err(CliError::from_error)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(CliError::from_error)?;
+    let inviter = runtime
+        .block_on(run_joiner(
+            paths,
+            config,
+            &identity,
+            &claimed.inviter_ticket,
+            claimed.join_nonce,
+            name,
+        ))
+        .map_err(CliError::from_error)?;
+
+    let network = NetworkHandle::start(paths.clone(), config.clone(), identity)
+        .map_err(CliError::from_error)?;
+    let completed = network.start_sync().map_err(CliError::from_error)?;
+    let summary = completed
+        .recv_timeout(std::time::Duration::from_secs(45))
+        .map_err(|_| CliError::new("sync_timeout", "initial synchronization timed out"))?;
+    network.shutdown().map_err(CliError::from_error)?;
+    if summary.succeeded == 0 {
+        return Err(CliError::new(
+            "initial_sync_failed",
+            "joined the group but could not synchronize with a peer",
+        ));
+    }
+    if json_output {
+        print_json(&json!({
+            "event": "joined",
+            "device_name": name,
+            "endpoint_id": setup.endpoint_id.to_string(),
+            "inviter_endpoint_id": inviter.to_string(),
+            "peers_synchronized": summary.succeeded
+        }));
+    } else {
+        println!("\nDevice approved. Initial synchronization complete.");
+    }
+    Ok(())
+}
+
+fn command_peers(
+    paths: &PlatformPaths,
+    _config: &Config,
+    command: &PeersCommand,
+    json_output: bool,
+) -> Result<(), CliError> {
+    let database = paths.data_dir.join("state.sqlite3");
+    if !database.exists() {
+        return Err(CliError::new("not_setup", "run `skillsync setup` first"));
+    }
+    let identity = load_identity(paths).map_err(CliError::from_error)?;
+    match command {
+        PeersCommand::List => {
+            let value = match request_if_running(paths, &ControlRequest::Peers)? {
+                Some(response) => response.result.expect("successful response"),
+                None => peers_value(
+                    &StateStore::open(&database).map_err(CliError::from_error)?,
+                    identity.endpoint_id(),
+                )
+                .map_err(CliError::from_error)?,
+            };
+            if json_output {
+                print_json(&value);
+            } else {
+                for peer in value["peers"].as_array().expect("peers is an array") {
+                    let local = if peer["local"].as_bool() == Some(true) {
+                        " (this device)"
+                    } else {
+                        ""
+                    };
+                    let online = if peer["online"].as_bool() == Some(true) {
+                        "online"
+                    } else {
+                        "offline"
+                    };
+                    println!(
+                        "{}{}\n  {}  {}",
+                        terminal_safe_device_name(peer["name"].as_str().unwrap_or("device")),
+                        local,
+                        peer["endpoint_id"].as_str().unwrap_or(""),
+                        online
+                    );
+                }
+            }
+        }
+        PeersCommand::Remove { device } => {
+            let mut state = StateStore::open(&database).map_err(CliError::from_error)?;
+            let endpoint = resolve_peer(&state, device).map_err(CliError::from_error)?;
+            let removed = match request_if_running(
+                paths,
+                &ControlRequest::RemovePeer {
+                    peer: endpoint.to_string(),
+                },
+            )? {
+                Some(response) => response.result.expect("successful response")["removed"]
+                    .as_bool()
+                    .unwrap_or(false),
+                None => {
+                    if endpoint == identity.endpoint_id() {
+                        return Err(CliError::new(
+                            "cannot_remove_self",
+                            "this device cannot remove itself",
+                        ));
+                    }
+                    state
+                        .apply_roster_change(&identity, RosterChange::Remove(endpoint))
+                        .map_err(CliError::from_error)?;
+                    true
+                }
+            };
+            if json_output {
+                print_json(&json!({
+                    "endpoint_id": endpoint.to_string(),
+                    "removed": removed
+                }));
+            } else {
+                println!("Device {} removed.", endpoint);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn command_setup(
@@ -123,7 +438,7 @@ fn command_setup(
             "created": result.created
         }));
     } else {
-        println!("Device: {}", result.device_name);
+        println!("Device: {}", terminal_safe_device_name(&result.device_name));
         println!("Group: personal\n");
         println!("Collections:");
         for (name, path) in result.collections {
@@ -159,7 +474,7 @@ fn command_status(
     } else {
         println!(
             "Device   {}",
-            value["device"]["name"].as_str().unwrap_or("unknown")
+            terminal_safe_device_name(value["device"]["name"].as_str().unwrap_or("unknown"))
         );
         println!(
             "Peers    {} online",
@@ -549,5 +864,39 @@ impl CliError {
 
     fn from_error(error: impl std::fmt::Display) -> Self {
         Self::new("operation_failed", error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join_approval_defaults_to_rejection() {
+        for answer in ["", "\n", "n", "no", "maybe", "true", "1"] {
+            assert!(!approval_answer(answer));
+        }
+        for answer in ["y", "Y", "yes", "YES", " yes\n"] {
+            assert!(approval_answer(answer));
+        }
+    }
+
+    #[test]
+    fn human_device_names_escape_terminal_controls_without_hiding_the_endpoint() {
+        let endpoint = "03ce2e2f55af140d0b18395fff054d3f3ab6a30aa680e4a2a3ab4526838151a5";
+        for name in [
+            "line\nbreak",
+            "ansi\u{1b}[31m",
+            "bidi\u{202e}name",
+            "mark\u{2067}name",
+        ] {
+            let output = join_request_human(name, endpoint);
+            assert!(output.contains(endpoint));
+            assert!(!output.contains('\u{1b}'));
+            assert!(!output.contains('\u{202e}'));
+            assert!(!output.contains('\u{2067}'));
+            assert!(!output.contains("line\nbreak"));
+            assert!(output.contains("\\u{"));
+        }
     }
 }

@@ -243,20 +243,22 @@ tradeoff of filesystem-time last-write-wins.
 
 ## Peer protocol
 
-All peer communication uses one versioned iroh ALPN:
+One iroh endpoint accepts two versioned ALPNs:
 
 ```text
 skillsync/1
+skillsync-join/1
 ```
 
-Joining and synchronization are phases of this protocol. Each connection
-follows this shape:
+`skillsync-join/1` carries the nonce proof, EndpointID approval, signed
+membership grant, complete roster, and initial peer hints. `skillsync/1`
+carries synchronization between current members. Each synchronization
+connection follows this shape:
 
 1. The iroh handshake authenticates both EndpointIDs and encrypts the channel.
 2. Peers exchange protocol version, group identity, device name, roster digest,
    and attached collection names.
-3. Unknown, removed, or wrong-group identities are refused unless the
-   connection carries the inviter's active join capability.
+3. Unknown, removed, or wrong-group identities are refused.
 4. Approved peers exchange complete signed roster chains and deterministically
    select the current chain.
 5. For every collection attached at both ends, peers exchange complete
@@ -314,14 +316,19 @@ inviter creates code
 
 `skillsync invite` sends the inviter's short-lived iroh EndpointTicket to the
 joining service and receives an opaque code plus a high-entropy join nonce.
-`skillsync join <code>` atomically claims the code, receives the ticket and
-nonce, and dials the inviter.
+`skillsync join <code> --name <name>` atomically claims the code, receives the
+ticket and nonce, and dials the inviter.
 
 The joiner proves possession of the claimed nonce inside the encrypted iroh
 session. The inviter obtains the joiner's EndpointID from the authenticated
 connection. The joiner prints its own EndpointID and the inviter prints that
 authenticated remote EndpointID in full. Approval requires an exact human
 comparison.
+
+Approval commits the signed admission before sending the roster to the joiner.
+If delivery is interrupted, a fresh invitation for the same EndpointID and
+device name refreshes its address hint and sends the current roster. A
+different name or a previously removed EndpointID is refused.
 
 The joining service's role ends after returning the inviter's ticket and join
 nonce. Membership approval stays with the inviter over iroh. The complete HTTP

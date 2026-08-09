@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -13,10 +13,15 @@ use url::Url;
 
 use crate::config::{Config, IrohPreset, PlatformPaths};
 use crate::identity::{DeviceIdentity, EndpointId};
+use crate::join::{
+    JOIN_ALPN, JoinCoordinator, JoinDecision, JoinError, PendingJoinInfo, SecretNonce, run_inviter,
+};
+use crate::roster::{RosterChange, RosterMember};
 use crate::setup::now_ns;
 use crate::state::{OperationalEvent, StateError, StateStore};
 use crate::sync::{
-    ConnectionSide, SessionConfig, SyncError, endpoint_from_iroh, endpoint_to_iroh, run_session,
+    ConnectionSide, SessionConfig, SyncError, endpoint_from_iroh, endpoint_to_iroh,
+    run_session_with_outcome,
 };
 
 const COMMAND_CAPACITY: usize = 8;
@@ -68,6 +73,8 @@ pub struct NetworkHandle {
     commands: mpsc::SyncSender<NetworkCommand>,
     endpoint_addr: Arc<Mutex<Option<EndpointAddr>>>,
     thread: Option<thread::JoinHandle<()>>,
+    joins: Arc<JoinCoordinator>,
+    paths: PlatformPaths,
 }
 
 impl NetworkHandle {
@@ -77,8 +84,12 @@ impl NetworkHandle {
         identity: DeviceIdentity,
     ) -> Result<Self, NetworkError> {
         let (commands, receiver) = mpsc::sync_channel(COMMAND_CAPACITY);
+        let joins = Arc::new(JoinCoordinator::default());
+        let worker_joins = joins.clone();
         let endpoint_addr = Arc::new(Mutex::new(None));
         let shared_addr = endpoint_addr.clone();
+        let worker_paths = paths.clone();
+        let worker_config = config.clone();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("skillsync-network".to_owned())
@@ -95,7 +106,7 @@ impl NetworkHandle {
                     }
                 };
                 runtime.block_on(async move {
-                    let endpoint = match bind_endpoint(&config, &identity).await {
+                    let endpoint = match bind_endpoint(&worker_config, &identity).await {
                         Ok(endpoint) => endpoint,
                         Err(error) => {
                             let _ = ready_tx.send(Err(error));
@@ -116,11 +127,12 @@ impl NetworkHandle {
                     }
                     run_network_loop(
                         endpoint.clone(),
-                        paths,
-                        config,
+                        worker_paths,
+                        worker_config,
                         local_endpoint,
                         receiver,
                         shared_addr,
+                        worker_joins,
                     )
                     .await;
                     endpoint.close().await;
@@ -133,6 +145,8 @@ impl NetworkHandle {
             commands,
             endpoint_addr,
             thread: Some(thread),
+            joins,
+            paths,
         })
     }
 
@@ -140,7 +154,7 @@ impl NetworkHandle {
         let _ = self.commands.try_send(NetworkCommand::Trigger);
     }
 
-    pub(crate) fn start_sync(&self) -> Result<mpsc::Receiver<SyncSummary>, NetworkError> {
+    pub fn start_sync(&self) -> Result<mpsc::Receiver<SyncSummary>, NetworkError> {
         let (completed, receiver) = mpsc::channel();
         self.commands
             .try_send(NetworkCommand::Sync { completed })
@@ -161,6 +175,62 @@ impl NetworkHandle {
         Ok(serde_json::to_string(&addr)?)
     }
 
+    pub fn activate_invitation(
+        &self,
+        nonce: SecretNonce,
+        lifetime: Duration,
+    ) -> Result<(), NetworkError> {
+        self.joins.activate(nonce, lifetime)?;
+        Ok(())
+    }
+
+    pub fn pending_join(&self) -> Result<Option<PendingJoinInfo>, NetworkError> {
+        Ok(self.joins.pending()?)
+    }
+
+    pub fn decide_join(&self, request_id: &str, approve: bool) -> Result<(), NetworkError> {
+        if !approve {
+            self.joins.decide(request_id, JoinDecision::rejected())?;
+            return Ok(());
+        }
+        let decision = match self.build_join_approval(request_id) {
+            Ok(decision) => decision,
+            Err(error) => {
+                let _ = self.joins.decide(request_id, JoinDecision::rejected());
+                return Err(error);
+            }
+        };
+        self.joins.decide(request_id, decision)?;
+        self.trigger();
+        Ok(())
+    }
+
+    fn build_join_approval(&self, request_id: &str) -> Result<JoinDecision, NetworkError> {
+        let (pending, joiner_addr) = self.joins.pending_addr(request_id)?;
+        build_join_approval_in(
+            &self.paths,
+            &self.endpoint_addr_json()?,
+            &pending,
+            &joiner_addr,
+        )
+    }
+
+    pub fn remove_peer(&self, peer: EndpointId) -> Result<bool, NetworkError> {
+        let identity = crate::setup::load_identity(&self.paths)?;
+        if peer == identity.endpoint_id() {
+            return Err(NetworkError::CannotRemoveSelf);
+        }
+        let mut state = StateStore::open(&self.paths.data_dir.join("state.sqlite3"))?;
+        let chain = state.selected_roster_chain()?;
+        let tip = chain.last().ok_or(NetworkError::MissingRoster)?;
+        if !tip.members().contains_key(&peer) {
+            return Ok(false);
+        }
+        state.apply_roster_change(&identity, RosterChange::Remove(peer))?;
+        self.trigger();
+        Ok(true)
+    }
+
     pub fn shutdown(mut self) -> Result<(), NetworkError> {
         let (completed, receiver) = mpsc::channel();
         let _ = self.commands.send(NetworkCommand::Shutdown { completed });
@@ -170,6 +240,90 @@ impl NetworkHandle {
         }
         Ok(())
     }
+}
+
+fn build_join_approval_in(
+    paths: &PlatformPaths,
+    local_addr_json: &str,
+    pending: &PendingJoinInfo,
+    joiner_addr: &str,
+) -> Result<JoinDecision, NetworkError> {
+    let identity = crate::setup::load_identity(paths)?;
+    let mut state = StateStore::open(&paths.data_dir.join("state.sqlite3"))?;
+    let roster = state.selected_roster_chain()?;
+    let tip = roster.last().ok_or(NetworkError::MissingRoster)?;
+    let active_name = tip.members().get(&pending.endpoint_id);
+    if active_name.is_some_and(|name| name != &pending.device_name) {
+        return Err(NetworkError::MemberNameMismatch);
+    }
+    if active_name.is_none()
+        && roster
+            .iter()
+            .any(|revision| revision.members().contains_key(&pending.endpoint_id))
+    {
+        return Err(NetworkError::RemovedMember);
+    }
+    let peer_hints = approval_peer_hints(&state, pending, &identity, local_addr_json)?;
+    let joiner_hints = [joiner_addr.to_owned()];
+    if active_name.is_none() {
+        let change = RosterChange::Admit(RosterMember::new(
+            pending.endpoint_id,
+            pending.device_name.clone(),
+        )?);
+        let candidate = crate::roster::RosterRevision::child(tip, change.clone(), &identity)?;
+        let mut candidate_roster = roster;
+        candidate_roster.push(candidate);
+        JoinDecision::approved(candidate_roster, peer_hints.clone())?;
+        state.apply_roster_change_with_peer_hints(
+            &identity,
+            change,
+            pending.endpoint_id,
+            &joiner_hints,
+            now_ns(),
+        )?;
+    } else {
+        state.replace_peer_hints(pending.endpoint_id, &joiner_hints, now_ns())?;
+    }
+    let roster = state.selected_roster_chain()?;
+    if roster
+        .last()
+        .and_then(|tip| tip.members().get(&pending.endpoint_id))
+        != Some(&pending.device_name)
+    {
+        return Err(NetworkError::MemberNameMismatch);
+    }
+    let peer_hints = approval_peer_hints(&state, pending, &identity, local_addr_json)?;
+    Ok(JoinDecision::approved(roster, peer_hints)?)
+}
+
+fn approval_peer_hints(
+    state: &StateStore,
+    pending: &PendingJoinInfo,
+    identity: &DeviceIdentity,
+    local_addr_json: &str,
+) -> Result<BTreeMap<String, Vec<String>>, NetworkError> {
+    let roster = state.selected_roster_chain()?;
+    let tip = roster.last().ok_or(NetworkError::MissingRoster)?;
+    let mut peer_hints = BTreeMap::new();
+    for endpoint in tip.members().keys().copied() {
+        if endpoint == pending.endpoint_id {
+            continue;
+        }
+        let hints = if endpoint == identity.endpoint_id() {
+            vec![local_addr_json.to_owned()]
+        } else {
+            state
+                .peer_hints(endpoint)?
+                .into_iter()
+                .take(1)
+                .map(|(hint, _)| hint)
+                .collect()
+        };
+        if !hints.is_empty() {
+            peer_hints.insert(endpoint.to_string(), hints);
+        }
+    }
+    Ok(peer_hints)
 }
 
 impl Drop for NetworkHandle {
@@ -225,7 +379,7 @@ fn configured_builder(
     };
     Ok(builder
         .secret_key(secret)
-        .alpns(vec![crate::protocol::ALPN.to_vec()]))
+        .alpns(vec![crate::protocol::ALPN.to_vec(), JOIN_ALPN.to_vec()]))
 }
 
 async fn run_network_loop(
@@ -235,6 +389,7 @@ async fn run_network_loop(
     local_endpoint: EndpointId,
     commands: mpsc::Receiver<NetworkCommand>,
     shared_addr: Arc<Mutex<Option<EndpointAddr>>>,
+    joins: Arc<JoinCoordinator>,
 ) {
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_SESSIONS));
     let mut tasks = JoinSet::new();
@@ -329,11 +484,14 @@ async fn run_network_loop(
                         spawn_incoming(
                             &mut tasks,
                             accepting,
-                            endpoint.addr(),
-                            paths.clone(),
-                            config.clone(),
-                            local_endpoint,
                             permit,
+                            IncomingContext {
+                                local_addr: endpoint.addr(),
+                                paths: paths.clone(),
+                                config: config.clone(),
+                                local_endpoint,
+                                joins: joins.clone(),
+                            },
                         );
                 }
             }
@@ -344,6 +502,9 @@ async fn run_network_loop(
                         if result.success && !waiters.is_empty() {
                             summary.succeeded = summary.succeeded.saturating_add(1);
                         }
+                    }
+                    if result.reconcile_again {
+                        pending_trigger = true;
                     }
                     record_result(
                         &paths,
@@ -366,6 +527,7 @@ struct TaskResult {
     success: bool,
     rejected: bool,
     local_failure: bool,
+    reconcile_again: bool,
 }
 
 fn spawn_outgoing(
@@ -385,6 +547,7 @@ fn spawn_outgoing(
                 success: false,
                 rejected: false,
                 local_failure: false,
+                reconcile_again: false,
             };
         };
         record_attempt(&paths, &config, peer);
@@ -399,10 +562,10 @@ fn spawn_outgoing(
             .map_err(|error| NetworkError::Connect(error.to_string()))?;
             let session =
                 SessionConfig::from_daemon(&paths, &config, local_endpoint, endpoint.addr());
-            run_session(connection, ConnectionSide::Dialer, session)
+            let outcome = run_session_with_outcome(connection, ConnectionSide::Dialer, session)
                 .await
                 .map_err(NetworkError::Sync)?;
-            Ok::<(), NetworkError>(())
+            Ok::<bool, NetworkError>(outcome.roster_changed)
         }
         .await;
         let local_failure = matches!(
@@ -420,31 +583,68 @@ fn spawn_outgoing(
             success: result.is_ok(),
             rejected,
             local_failure,
+            reconcile_again: result.as_ref().copied().unwrap_or_else(|error| {
+                matches!(
+                    error,
+                    NetworkError::Sync(SyncError::RosterChangedAndUnauthorizedPeer)
+                )
+            }),
         }
     });
+}
+
+#[derive(Clone)]
+struct IncomingContext {
+    local_addr: EndpointAddr,
+    paths: PlatformPaths,
+    config: Config,
+    local_endpoint: EndpointId,
+    joins: Arc<JoinCoordinator>,
 }
 
 fn spawn_incoming(
     tasks: &mut JoinSet<TaskResult>,
     accepting: iroh::endpoint::Accepting,
-    local_addr: EndpointAddr,
-    paths: PlatformPaths,
-    config: Config,
-    local_endpoint: EndpointId,
     permit: tokio::sync::OwnedSemaphorePermit,
+    context: IncomingContext,
 ) {
     tasks.spawn(async move {
         let _permit = permit;
         let connection = tokio::time::timeout(Duration::from_secs(10), accepting).await;
-        let (peer, result) = match connection {
+        let (peer, result, reconcile_again) = match connection {
             Ok(Ok(connection)) => {
                 let peer = endpoint_from_iroh(connection.remote_id());
-                let session =
-                    SessionConfig::from_daemon(&paths, &config, local_endpoint, local_addr);
-                let result = run_session(connection, ConnectionSide::Acceptor, session).await;
-                (peer, result)
+                if connection.alpn() == JOIN_ALPN {
+                    let result = run_inviter(connection, context.joins)
+                        .await
+                        .map(|_| peer)
+                        .map_err(|_| SyncError::JoinRejected);
+                    (peer, result, false)
+                } else {
+                    let session = SessionConfig::from_daemon(
+                        &context.paths,
+                        &context.config,
+                        context.local_endpoint,
+                        context.local_addr,
+                    );
+                    let outcome =
+                        run_session_with_outcome(connection, ConnectionSide::Acceptor, session)
+                            .await;
+                    let reconcile_again =
+                        outcome.as_ref().is_ok_and(|outcome| outcome.roster_changed)
+                            || matches!(
+                                outcome.as_ref(),
+                                Err(SyncError::RosterChangedAndUnauthorizedPeer)
+                            );
+                    let result = outcome.map(|outcome| outcome.remote_endpoint);
+                    (peer, result, reconcile_again)
+                }
             }
-            _ => (EndpointId::from_bytes([0; 32]), Err(SyncError::Transport)),
+            _ => (
+                EndpointId::from_bytes([0; 32]),
+                Err(SyncError::Transport),
+                false,
+            ),
         };
         TaskResult {
             peer,
@@ -454,6 +654,7 @@ fn spawn_incoming(
                 .as_ref()
                 .is_err_and(|error| !error.is_connectivity_failure() && !error.is_local_failure()),
             local_failure: result.as_ref().is_err_and(SyncError::is_local_failure),
+            reconcile_again,
         }
     });
 }
@@ -529,8 +730,22 @@ fn record_result(
                 peer_endpoint: peer,
             }
         };
-        let _ =
-            state.record_peer_health(peer, success, now_ns(), &event, config.logging.max_entries);
+        let active = state
+            .selected_roster_chain()
+            .ok()
+            .and_then(|chain| chain.last().cloned())
+            .is_some_and(|tip| tip.members().contains_key(&peer));
+        if active {
+            let _ = state.record_peer_health(
+                peer,
+                success,
+                now_ns(),
+                &event,
+                config.logging.max_entries,
+            );
+        } else if rejected {
+            let _ = state.append_log(now_ns(), &event, config.logging.max_entries);
+        }
     }
 }
 
@@ -562,6 +777,12 @@ pub enum NetworkError {
     ConnectTimeout,
     #[error("local roster is missing")]
     MissingRoster,
+    #[error("this device cannot remove itself")]
+    CannotRemoveSelf,
+    #[error("joining EndpointID is active under a different device name")]
+    MemberNameMismatch,
+    #[error("joining EndpointID was removed from this group")]
+    RemovedMember,
     #[error(transparent)]
     State(#[from] StateError),
     #[error(transparent)]
@@ -570,6 +791,12 @@ pub enum NetworkError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Join(#[from] JoinError),
+    #[error(transparent)]
+    Roster(#[from] crate::roster::RosterError),
+    #[error(transparent)]
+    Setup(#[from] crate::setup::SetupError),
 }
 
 #[cfg(test)]
@@ -584,6 +811,7 @@ mod tests {
     use crate::path::ProtocolPath;
     use crate::record::{Manifest, Record};
     use crate::roster::{RosterChange, RosterMember, RosterRevision};
+    use crate::sync::run_session;
 
     use super::*;
 
@@ -727,6 +955,139 @@ mod tests {
                 relay_urls: vec!["https://relay.example.net".to_owned()],
                 address_lookup_urls: vec!["https://lookup.example.net".to_owned()],
             }
+        );
+    }
+
+    #[test]
+    fn failed_delivery_can_resume_the_same_member_and_refresh_its_hint() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = PlatformPaths {
+            config_file: temporary.path().join("config.toml"),
+            data_dir: temporary.path().join("data"),
+            runtime_dir: temporary.path().join("run"),
+        };
+        fs::create_dir_all(&paths.data_dir).unwrap();
+        let (local, _) = crate::identity::IdentityStore::new(&paths)
+            .load_or_create()
+            .unwrap();
+        let joiner = DeviceIdentity::from_secret([73; 32]);
+        let genesis = RosterRevision::genesis(
+            crate::identity::GroupId::from_bytes([71; 32]),
+            "local",
+            &local,
+        )
+        .unwrap();
+        let mut state = StateStore::open(&paths.data_dir.join("state.sqlite3")).unwrap();
+        state.insert_roster_revision(&genesis).unwrap();
+        drop(state);
+        let local_addr = serde_json::to_string(&EndpointAddr::new(
+            endpoint_to_iroh(local.endpoint_id()).unwrap(),
+        ))
+        .unwrap();
+        let pending = PendingJoinInfo {
+            request_id: "first".to_owned(),
+            endpoint_id: joiner.endpoint_id(),
+            device_name: "joiner".to_owned(),
+        };
+        let first_addr = serde_json::to_string(
+            &EndpointAddr::new(endpoint_to_iroh(joiner.endpoint_id()).unwrap())
+                .with_ip_addr("127.0.0.1:41001".parse().unwrap()),
+        )
+        .unwrap();
+        assert!(matches!(
+            build_join_approval_in(&paths, &"x".repeat(16 * 1024 + 1), &pending, &first_addr),
+            Err(NetworkError::Join(JoinError::InvalidAddress))
+        ));
+        assert_eq!(
+            StateStore::open(&paths.data_dir.join("state.sqlite3"))
+                .unwrap()
+                .selected_roster_chain()
+                .unwrap()
+                .len(),
+            1
+        );
+        build_join_approval_in(&paths, &local_addr, &pending, &first_addr).unwrap();
+
+        // Dropping the decision models a response or acknowledgement failure after
+        // the signed admission has committed.
+        let second_addr = serde_json::to_string(
+            &EndpointAddr::new(endpoint_to_iroh(joiner.endpoint_id()).unwrap())
+                .with_ip_addr("127.0.0.1:41002".parse().unwrap()),
+        )
+        .unwrap();
+        build_join_approval_in(&paths, &local_addr, &pending, &second_addr).unwrap();
+        let state = StateStore::open(&paths.data_dir.join("state.sqlite3")).unwrap();
+        let chain = state.selected_roster_chain().unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(
+            chain.last().unwrap().members().get(&joiner.endpoint_id()),
+            Some(&"joiner".to_owned())
+        );
+        let saved_hints = state.peer_hints(joiner.endpoint_id()).unwrap();
+        assert_eq!(saved_hints.len(), 1);
+        assert_eq!(saved_hints[0].0, second_addr);
+        drop(state);
+
+        let mismatched = PendingJoinInfo {
+            request_id: "different-name".to_owned(),
+            endpoint_id: joiner.endpoint_id(),
+            device_name: "other".to_owned(),
+        };
+        assert!(matches!(
+            build_join_approval_in(&paths, &local_addr, &mismatched, &first_addr),
+            Err(NetworkError::MemberNameMismatch)
+        ));
+        let mut state = StateStore::open(&paths.data_dir.join("state.sqlite3")).unwrap();
+        state
+            .apply_roster_change(&local, RosterChange::Remove(joiner.endpoint_id()))
+            .unwrap();
+        drop(state);
+        assert!(matches!(
+            build_join_approval_in(&paths, &local_addr, &pending, &first_addr),
+            Err(NetworkError::RemovedMember)
+        ));
+    }
+
+    #[test]
+    fn unknown_rejections_do_not_grow_peer_health_and_logs_stay_bounded() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = PlatformPaths {
+            config_file: temporary.path().join("config.toml"),
+            data_dir: temporary.path().join("data"),
+            runtime_dir: temporary.path().join("run"),
+        };
+        fs::create_dir_all(&paths.data_dir).unwrap();
+        let local = DeviceIdentity::from_secret([80; 32]);
+        let genesis = RosterRevision::genesis(
+            crate::identity::GroupId::from_bytes([81; 32]),
+            "local",
+            &local,
+        )
+        .unwrap();
+        let mut state = StateStore::open(&paths.data_dir.join("state.sqlite3")).unwrap();
+        state.insert_roster_revision(&genesis).unwrap();
+        drop(state);
+        let mut config = Config::default();
+        config.logging.max_entries = 7;
+        for seed in 0_u16..200 {
+            let mut bytes = [0_u8; 32];
+            bytes[..2].copy_from_slice(&seed.to_be_bytes());
+            record_result(
+                &paths,
+                &config,
+                DeviceIdentity::from_secret(bytes).endpoint_id(),
+                false,
+                true,
+                false,
+            );
+        }
+        let state = StateStore::open(&paths.data_dir.join("state.sqlite3")).unwrap();
+        assert_eq!(state.peer_health_row_count().unwrap(), 0);
+        let logs = state.logs().unwrap();
+        assert_eq!(logs.len(), 7);
+        assert!(
+            logs.iter()
+                .all(|log| matches!(log.event, OperationalEvent::PeerRejected { .. }))
         );
     }
 

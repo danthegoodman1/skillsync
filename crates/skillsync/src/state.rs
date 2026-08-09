@@ -7,14 +7,15 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use thiserror::Error;
 
-use crate::identity::{EndpointId, IdentityReference};
+use crate::identity::{DeviceIdentity, EndpointId, IdentityReference};
 use crate::path::{PathError, ProtocolPath};
 use crate::record::{Record, RecordError};
-use crate::roster::{RosterError, RosterHash, RosterRevision, select_chain};
+use crate::roster::{RosterChange, RosterError, RosterHash, RosterRevision, select_chain};
 
 const SCHEMA_VERSION: i64 = 6;
 const MAX_PEER_HINTS: usize = 32;
 const MAX_PEER_HINT_BYTES: usize = 16 * 1024;
+const MAX_ROSTER_RETRY_DEPTH: usize = 1_024;
 
 pub struct StateStore {
     connection: Connection,
@@ -397,6 +398,185 @@ impl StateStore {
         Ok(())
     }
 
+    pub fn apply_roster_change(
+        &mut self,
+        identity: &DeviceIdentity,
+        change: RosterChange,
+    ) -> Result<RosterRevision, StateError> {
+        self.apply_roster_change_inner(identity, change, None)
+    }
+
+    pub fn apply_roster_change_with_peer_hints(
+        &mut self,
+        identity: &DeviceIdentity,
+        change: RosterChange,
+        hint_endpoint: EndpointId,
+        hints: &[String],
+        updated_ns: i64,
+    ) -> Result<RosterRevision, StateError> {
+        validate_peer_hints(hints)?;
+        self.apply_roster_change_inner(identity, change, Some((hint_endpoint, hints, updated_ns)))
+    }
+
+    fn apply_roster_change_inner(
+        &mut self,
+        identity: &DeviceIdentity,
+        change: RosterChange,
+        peer_hints: Option<(EndpointId, &[String], i64)>,
+    ) -> Result<RosterRevision, StateError> {
+        for _ in 0..=MAX_ROSTER_RETRY_DEPTH {
+            let chain = self.selected_roster_chain()?;
+            let parent = chain
+                .last()
+                .ok_or(StateError::RosterTopology("roster genesis is missing"))?;
+            if roster_change_is_satisfied(parent, &change) {
+                if let Some((endpoint, hints, updated_ns)) = peer_hints {
+                    let transaction = self
+                        .connection
+                        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    replace_peer_hints_in(&transaction, endpoint, hints, updated_ns)?;
+                    transaction.commit()?;
+                }
+                return Ok(parent.clone());
+            }
+            let revision = RosterRevision::child(parent, change.clone(), identity)?;
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if load_roster_revision(&transaction, revision.canonical_hash())?.is_none() {
+                insert_roster_revision_row(&transaction, &revision)?;
+            }
+            if let Some((endpoint, hints, updated_ns)) = peer_hints {
+                replace_peer_hints_in(&transaction, endpoint, hints, updated_ns)?;
+            }
+            transaction.commit()?;
+            let selected = self.selected_roster_chain()?;
+            let selected_tip = selected
+                .last()
+                .ok_or(StateError::RosterTopology("roster genesis is missing"))?;
+            if roster_change_is_satisfied(selected_tip, &change) {
+                return Ok(selected_tip.clone());
+            }
+        }
+        Err(StateError::RosterRetryLimit)
+    }
+
+    pub fn install_joined_roster_chain(
+        &mut self,
+        revisions: &[RosterRevision],
+        local_endpoint: EndpointId,
+    ) -> Result<(), StateError> {
+        self.install_joined_state(revisions, local_endpoint, &[])
+    }
+
+    pub fn install_joined_state(
+        &mut self,
+        revisions: &[RosterRevision],
+        local_endpoint: EndpointId,
+        peer_hints: &[(EndpointId, Vec<String>)],
+    ) -> Result<(), StateError> {
+        self.install_joined_state_inner(revisions, local_endpoint, None, peer_hints, false)
+    }
+
+    pub fn install_or_resume_joined_state(
+        &mut self,
+        revisions: &[RosterRevision],
+        local_endpoint: EndpointId,
+        local_name: &str,
+        peer_hints: &[(EndpointId, Vec<String>)],
+    ) -> Result<(), StateError> {
+        self.install_joined_state_inner(
+            revisions,
+            local_endpoint,
+            Some(local_name),
+            peer_hints,
+            true,
+        )
+    }
+
+    fn install_joined_state_inner(
+        &mut self,
+        revisions: &[RosterRevision],
+        local_endpoint: EndpointId,
+        local_name: Option<&str>,
+        peer_hints: &[(EndpointId, Vec<String>)],
+        allow_resume: bool,
+    ) -> Result<(), StateError> {
+        let Some(genesis) = revisions.first() else {
+            return Err(StateError::RosterTopology("joined roster is empty"));
+        };
+        genesis.validate_genesis()?;
+        for pair in revisions.windows(2) {
+            pair[1].validate_child(&pair[0])?;
+        }
+        let tip = revisions
+            .last()
+            .ok_or(StateError::RosterTopology("joined roster is empty"))?;
+        if !tip.members().contains_key(&local_endpoint) {
+            return Err(StateError::RosterTopology(
+                "joined roster does not contain this device",
+            ));
+        }
+        if local_name.is_some_and(|name| {
+            tip.members().get(&local_endpoint).map(String::as_str) != Some(name)
+        }) {
+            return Err(StateError::RosterTopology(
+                "joined roster has a different local device name",
+            ));
+        }
+        let existing = self.selected_roster_chain()?;
+        if !allow_resume && !existing.is_empty() {
+            return Err(StateError::RosterTopology(
+                "local state already belongs to a group",
+            ));
+        }
+        if existing.first().is_some_and(|existing_genesis| {
+            existing_genesis.canonical_hash() != genesis.canonical_hash()
+        }) {
+            return Err(StateError::RosterTopology(
+                "joined roster belongs to a different group",
+            ));
+        }
+        if allow_resume
+            && existing.last().is_some_and(|tip| {
+                local_name.is_none_or(|name| {
+                    tip.members().get(&local_endpoint).map(String::as_str) != Some(name)
+                })
+            })
+        {
+            return Err(StateError::RosterTopology(
+                "local membership cannot resume this join",
+            ));
+        }
+        for (_, hints) in peer_hints {
+            validate_peer_hints(hints)?;
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for revision in revisions {
+            if load_roster_revision(&transaction, revision.canonical_hash())?.is_none() {
+                insert_roster_revision_row(&transaction, revision)?;
+            }
+        }
+        for (endpoint, hints) in peer_hints {
+            replace_peer_hints_in(&transaction, *endpoint, hints, crate::setup::now_ns())?;
+        }
+        transaction.commit()?;
+        if allow_resume
+            && self.selected_roster_chain()?.last().is_none_or(|tip| {
+                local_name.is_none_or(|name| {
+                    tip.members().get(&local_endpoint).map(String::as_str) != Some(name)
+                })
+            })
+        {
+            return Err(StateError::RosterTopology(
+                "selected roster cannot resume this join",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn merge_record(
         &mut self,
         record: &Record,
@@ -677,30 +857,11 @@ impl StateStore {
         hints: &[String],
         updated_ns: i64,
     ) -> Result<(), StateError> {
-        if hints.len() > MAX_PEER_HINTS
-            || hints
-                .iter()
-                .any(|hint| hint.is_empty() || hint.len() > MAX_PEER_HINT_BYTES)
-        {
-            return Err(StateError::PeerHintLimit);
-        }
-        let unique = hints.iter().collect::<std::collections::BTreeSet<_>>();
-        if unique.len() != hints.len() {
-            return Err(StateError::PeerHintLimit);
-        }
+        validate_peer_hints(hints)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "DELETE FROM peer_hints WHERE endpoint_id = ?1",
-            [endpoint_id.as_bytes()],
-        )?;
-        for hint in hints {
-            transaction.execute(
-                "INSERT INTO peer_hints (endpoint_id, hint, updated_ns) VALUES (?1, ?2, ?3)",
-                params![endpoint_id.as_bytes(), hint, updated_ns],
-            )?;
-        }
+        replace_peer_hints_in(&transaction, endpoint_id, hints, updated_ns)?;
         transaction.commit()?;
         Ok(())
     }
@@ -741,6 +902,14 @@ impl StateStore {
             )
             .optional()?
             .unwrap_or(false))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn peer_health_row_count(&self) -> Result<usize, StateError> {
+        let count: i64 =
+            self.connection
+                .query_row("SELECT count(*) FROM peer_health", [], |row| row.get(0))?;
+        usize::try_from(count).map_err(|_| StateError::NumberOverflow)
     }
 
     pub fn append_log(
@@ -1404,6 +1573,71 @@ fn load_roster_revision(
         .transpose()
 }
 
+fn insert_roster_revision_row(
+    transaction: &Transaction<'_>,
+    revision: &RosterRevision,
+) -> Result<(), StateError> {
+    let hash = revision.canonical_hash();
+    transaction.execute(
+        "INSERT INTO roster_revisions
+            (hash, revision_number, parent_hash, canonical)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            hash.as_bytes(),
+            i64::try_from(revision.number()).map_err(|_| StateError::NumberOverflow)?,
+            revision.parent_hash().map(|hash| *hash.as_bytes()),
+            revision.canonical_bytes()
+        ],
+    )?;
+    Ok(())
+}
+
+fn roster_change_is_satisfied(revision: &RosterRevision, change: &RosterChange) -> bool {
+    match change {
+        RosterChange::Initialize(member) => revision
+            .members()
+            .get(&member.endpoint_id)
+            .is_some_and(|name| name == &member.device_name),
+        RosterChange::Admit(member) => revision.members().contains_key(&member.endpoint_id),
+        RosterChange::Remove(endpoint_id) => !revision.members().contains_key(endpoint_id),
+    }
+}
+
+fn validate_peer_hints(hints: &[String]) -> Result<(), StateError> {
+    if hints.len() > MAX_PEER_HINTS
+        || hints
+            .iter()
+            .any(|hint| hint.is_empty() || hint.len() > MAX_PEER_HINT_BYTES)
+        || hints
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != hints.len()
+    {
+        return Err(StateError::PeerHintLimit);
+    }
+    Ok(())
+}
+
+fn replace_peer_hints_in(
+    connection: &Connection,
+    endpoint_id: EndpointId,
+    hints: &[String],
+    updated_ns: i64,
+) -> Result<(), StateError> {
+    connection.execute(
+        "DELETE FROM peer_hints WHERE endpoint_id = ?1",
+        [endpoint_id.as_bytes()],
+    )?;
+    for hint in hints {
+        connection.execute(
+            "INSERT INTO peer_hints (endpoint_id, hint, updated_ns) VALUES (?1, ?2, ?3)",
+            params![endpoint_id.as_bytes(), hint, updated_ns],
+        )?;
+    }
+    Ok(())
+}
+
 fn roster_hash_from_blob(bytes: Vec<u8>) -> Result<RosterHash, StateError> {
     let bytes = bytes
         .try_into()
@@ -1992,6 +2226,8 @@ pub enum StateError {
     NumberOverflow,
     #[error("peer address hints exceed their count or size limit")]
     PeerHintLimit,
+    #[error("roster mutation could not be selected within the revision limit")]
+    RosterRetryLimit,
     #[error(transparent)]
     Record(#[from] RecordError),
     #[error(transparent)]
@@ -2652,5 +2888,197 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(store.replace_peer_hints(peer, &too_many, 3).is_err());
         assert_eq!(store.peer_hints(peer).unwrap(), vec![("new".to_owned(), 2)]);
+    }
+
+    #[test]
+    fn losing_local_admission_retries_from_the_selected_parent() {
+        let creator = DeviceIdentity::from_secret([1; 32]);
+        let first = DeviceIdentity::from_secret([2; 32]);
+        let second = DeviceIdentity::from_secret([3; 32]);
+        let genesis =
+            RosterRevision::genesis(GroupId::from_bytes([8; 32]), "creator", &creator).unwrap();
+        let first_change = admission(&first, "first");
+        let first_child = RosterRevision::child(&genesis, first_change.clone(), &creator).unwrap();
+        let second_child =
+            RosterRevision::child(&genesis, admission(&second, "second"), &creator).unwrap();
+        let (losing_change, winner) =
+            if first_child.canonical_hash() < second_child.canonical_hash() {
+                (first_change, second_child.clone())
+            } else {
+                (admission(&second, "second"), first_child.clone())
+            };
+        let mut store = StateStore::open_in_memory().unwrap();
+        store.insert_roster_revision(&genesis).unwrap();
+        store.insert_roster_revision(&first_child).unwrap();
+        store.insert_roster_revision(&second_child).unwrap();
+        let selected = store
+            .apply_roster_change(&creator, losing_change.clone())
+            .unwrap();
+        assert_eq!(selected.parent_hash(), Some(winner.canonical_hash()));
+        assert!(roster_change_is_satisfied(&selected, &losing_change));
+        assert_eq!(store.selected_roster_chain().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn competing_names_for_one_endpoint_keep_the_selected_name_without_retrying() {
+        let temporary = tempfile::tempdir().unwrap();
+        let database = temporary.path().join("state.sqlite3");
+        let creator = DeviceIdentity::from_secret([11; 32]);
+        let joining = DeviceIdentity::from_secret([12; 32]);
+        let genesis =
+            RosterRevision::genesis(GroupId::from_bytes([13; 32]), "creator", &creator).unwrap();
+        let first_change = admission(&joining, "first-name");
+        let second_change = admission(&joining, "second-name");
+        let first = RosterRevision::child(&genesis, first_change.clone(), &creator).unwrap();
+        let second = RosterRevision::child(&genesis, second_change.clone(), &creator).unwrap();
+        let (winner, losing_change) = if first.canonical_hash() > second.canonical_hash() {
+            (&first, second_change)
+        } else {
+            (&second, first_change)
+        };
+        let selected_name = winner
+            .members()
+            .get(&joining.endpoint_id())
+            .unwrap()
+            .clone();
+        let mut store = StateStore::open(&database).unwrap();
+        for revision in [&genesis, &first, &second] {
+            store.insert_roster_revision(revision).unwrap();
+        }
+        for _ in 0..3 {
+            store
+                .apply_roster_change(&creator, losing_change.clone())
+                .unwrap();
+        }
+        assert_eq!(store.selected_roster_chain().unwrap().len(), 2);
+        assert_eq!(
+            store
+                .selected_roster_chain()
+                .unwrap()
+                .last()
+                .unwrap()
+                .members()
+                .get(&joining.endpoint_id()),
+            Some(&selected_name)
+        );
+        drop(store);
+        let mut reopened = StateStore::open(&database).unwrap();
+        reopened
+            .apply_roster_change(&creator, losing_change)
+            .unwrap();
+        let selected = reopened.selected_roster_chain().unwrap();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(
+            selected
+                .last()
+                .unwrap()
+                .members()
+                .get(&joining.endpoint_id()),
+            Some(&selected_name)
+        );
+    }
+
+    #[test]
+    fn competing_removal_wins_then_admission_retries_and_reopens() {
+        let temporary = tempfile::tempdir().unwrap();
+        let database = temporary.path().join("state.sqlite3");
+        let creator = DeviceIdentity::from_secret([1; 32]);
+        let existing = DeviceIdentity::from_secret([2; 32]);
+        let joining = DeviceIdentity::from_secret([3; 32]);
+        let genesis =
+            RosterRevision::genesis(GroupId::from_bytes([7; 32]), "creator", &creator).unwrap();
+        let parent =
+            RosterRevision::child(&genesis, admission(&existing, "existing"), &creator).unwrap();
+        let removal = RosterRevision::child(
+            &parent,
+            RosterChange::Remove(existing.endpoint_id()),
+            &creator,
+        )
+        .unwrap();
+        let joining_change = admission(&joining, "joining");
+        let competing_admission =
+            RosterRevision::child(&parent, joining_change.clone(), &creator).unwrap();
+        let mut store = StateStore::open(&database).unwrap();
+        for revision in [&genesis, &parent, &competing_admission, &removal] {
+            store.insert_roster_revision(revision).unwrap();
+        }
+        let selected = store.apply_roster_change(&creator, joining_change).unwrap();
+        assert_eq!(selected.parent_hash(), Some(removal.canonical_hash()));
+        assert!(!selected.members().contains_key(&existing.endpoint_id()));
+        assert!(selected.members().contains_key(&joining.endpoint_id()));
+        drop(store);
+        let reopened = StateStore::open(&database).unwrap();
+        assert_eq!(
+            reopened
+                .selected_roster_chain()
+                .unwrap()
+                .last()
+                .unwrap()
+                .canonical_hash(),
+            selected.canonical_hash()
+        );
+    }
+
+    #[test]
+    fn joined_roster_install_is_all_or_nothing_and_requires_local_membership() {
+        let creator = DeviceIdentity::from_secret([1; 32]);
+        let joiner = DeviceIdentity::from_secret([2; 32]);
+        let outsider = DeviceIdentity::from_secret([3; 32]);
+        let genesis =
+            RosterRevision::genesis(GroupId::from_bytes([6; 32]), "creator", &creator).unwrap();
+        let admission =
+            RosterRevision::child(&genesis, admission(&joiner, "joiner"), &creator).unwrap();
+        let mut store = StateStore::open_in_memory().unwrap();
+        assert!(
+            store
+                .install_joined_roster_chain(
+                    &[genesis.clone(), admission.clone()],
+                    outsider.endpoint_id()
+                )
+                .is_err()
+        );
+        assert!(store.selected_roster_chain().unwrap().is_empty());
+        let oversized_hints = vec!["x".repeat(MAX_PEER_HINT_BYTES + 1)];
+        assert!(
+            store
+                .install_joined_state(
+                    &[genesis.clone(), admission.clone()],
+                    joiner.endpoint_id(),
+                    &[(creator.endpoint_id(), oversized_hints)]
+                )
+                .is_err()
+        );
+        assert!(store.selected_roster_chain().unwrap().is_empty());
+        store
+            .install_joined_roster_chain(
+                &[genesis.clone(), admission.clone()],
+                joiner.endpoint_id(),
+            )
+            .unwrap();
+        assert_eq!(
+            store.selected_roster_chain().unwrap(),
+            vec![genesis.clone(), admission.clone()]
+        );
+        store
+            .install_or_resume_joined_state(
+                &[genesis.clone(), admission.clone()],
+                joiner.endpoint_id(),
+                "joiner",
+                &[(creator.endpoint_id(), vec!["refreshed".to_owned()])],
+            )
+            .unwrap();
+        let refreshed = store.peer_hints(creator.endpoint_id()).unwrap();
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(refreshed[0].0, "refreshed");
+        assert!(
+            store
+                .install_or_resume_joined_state(
+                    &[genesis, admission],
+                    joiner.endpoint_id(),
+                    "different",
+                    &[]
+                )
+                .is_err()
+        );
     }
 }

@@ -171,10 +171,10 @@ The first successful claim atomically consumes the invitation and returns
 }
 ```
 
-The claimant then dials `inviter_ticket` and sends `join_nonce` in the first
-application message over the `skillsync/1` iroh session. The inviter accepts
-the request only while the same nonce is active locally. Membership begins
-after the EndpointID comparison and the inviter's signed grant.
+The claimant then dials `inviter_ticket` with the `skillsync-join/1` ALPN and
+sends `join_nonce` in the first application message. The inviter accepts the
+request only while the same nonce is active locally. Membership begins after
+the EndpointID comparison and the inviter's signed grant.
 
 The invitation remains consumed after a dropped connection or rejected
 EndpointID. The inviter creates a new code for another attempt.

@@ -4,6 +4,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -15,7 +16,9 @@ use thiserror::Error;
 use crate::config::{Config, PlatformPaths};
 use crate::filesystem::{ScanError, ScanSummary, Scanner};
 use crate::identity::EndpointId;
+use crate::join::SecretNonce;
 use crate::network::{NetworkError, NetworkHandle};
+use crate::process_lock::{ProcessLock, ProcessLockError};
 use crate::setup::{DEFAULT_COLLECTIONS, load_identity, now_ns, setup};
 use crate::state::{
     CollectionScanStatus, CollectionWatchStatus, OperationalEvent, OperationalLog,
@@ -53,6 +56,19 @@ pub enum ControlRequest {
         wait: bool,
     },
     EndpointAddr,
+    Peers,
+    RemovePeer {
+        peer: String,
+    },
+    ActivateInvitation {
+        nonce: SecretNonce,
+        lifetime_seconds: u64,
+    },
+    PendingJoin,
+    DecideJoin {
+        request_id: String,
+        approve: bool,
+    },
     Shutdown,
 }
 
@@ -125,6 +141,7 @@ pub fn is_running(paths: &PlatformPaths) -> bool {
 }
 
 pub fn run(paths: PlatformPaths, config: Config) -> Result<(), DaemonError> {
+    let _process_lock = ProcessLock::acquire(&paths)?;
     setup(&paths, &config)?;
     let identity = load_identity(&paths)?;
     let endpoint_id = identity.endpoint_id();
@@ -419,6 +436,56 @@ fn handle_request(
             .endpoint_addr_json()
             .map(|address| (json!({ "address": address }), DaemonAction::None))
             .map_err(DaemonError::from),
+        ControlRequest::Peers => {
+            peers_value(state, endpoint_id).map(|value| (value, DaemonAction::None))
+        }
+        ControlRequest::RemovePeer { peer } => resolve_peer(state, &peer).and_then(|endpoint| {
+            network
+                .remove_peer(endpoint)
+                .map(|removed| {
+                    (
+                        json!({ "endpoint_id": endpoint.to_string(), "removed": removed }),
+                        DaemonAction::TriggerNetwork,
+                    )
+                })
+                .map_err(DaemonError::from)
+        }),
+        ControlRequest::ActivateInvitation {
+            nonce,
+            lifetime_seconds,
+        } => network
+            .activate_invitation(nonce, Duration::from_secs(lifetime_seconds))
+            .map(|_| (json!({ "active": true }), DaemonAction::None))
+            .map_err(DaemonError::from),
+        ControlRequest::PendingJoin => network
+            .pending_join()
+            .map(|pending| {
+                let pending = pending.map(|pending| {
+                    json!({
+                        "request_id": pending.request_id,
+                        "endpoint_id": pending.endpoint_id.to_string(),
+                        "device_name": pending.device_name
+                    })
+                });
+                (json!({ "pending": pending }), DaemonAction::None)
+            })
+            .map_err(DaemonError::from),
+        ControlRequest::DecideJoin {
+            request_id,
+            approve,
+        } => network
+            .decide_join(&request_id, approve)
+            .map(|_| {
+                (
+                    json!({ "request_id": request_id, "approved": approve }),
+                    if approve {
+                        DaemonAction::TriggerNetwork
+                    } else {
+                        DaemonAction::None
+                    },
+                )
+            })
+            .map_err(DaemonError::from),
         ControlRequest::Shutdown => Ok((json!({ "stopped": true }), DaemonAction::Stop)),
     };
     match result {
@@ -427,6 +494,49 @@ fn handle_request(
             ControlResponse::failure("daemon_operation_failed", error.to_string()),
             DaemonAction::None,
         ),
+    }
+}
+
+pub fn peers_value(state: &StateStore, local_endpoint: EndpointId) -> Result<Value, DaemonError> {
+    let chain = state.selected_roster_chain()?;
+    let tip = chain
+        .last()
+        .ok_or(DaemonError::Protocol("local roster is missing"))?;
+    let peers = tip
+        .members()
+        .iter()
+        .map(|(endpoint, name)| {
+            Ok(json!({
+                "name": name,
+                "endpoint_id": endpoint.to_string(),
+                "local": *endpoint == local_endpoint,
+                "online": *endpoint == local_endpoint || state.peer_reachable(*endpoint)?
+            }))
+        })
+        .collect::<Result<Vec<_>, StateError>>()?;
+    Ok(json!({ "peers": peers }))
+}
+
+pub fn resolve_peer(state: &StateStore, query: &str) -> Result<EndpointId, DaemonError> {
+    let chain = state.selected_roster_chain()?;
+    let tip = chain
+        .last()
+        .ok_or(DaemonError::Protocol("local roster is missing"))?;
+    if let Ok(endpoint) = EndpointId::from_str(query)
+        && tip.members().contains_key(&endpoint)
+    {
+        return Ok(endpoint);
+    }
+    let matches = tip
+        .members()
+        .iter()
+        .filter(|(_, name)| name.as_str() == query)
+        .map(|(endpoint, _)| *endpoint)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [endpoint] => Ok(*endpoint),
+        [] => Err(DaemonError::UnknownPeer),
+        _ => Err(DaemonError::AmbiguousPeer),
     }
 }
 
@@ -645,6 +755,11 @@ pub fn status_value(
 ) -> Result<Value, DaemonError> {
     let (files, degraded) = state.local_counts()?;
     let chain = state.selected_roster_chain()?;
+    let selected_name = chain
+        .last()
+        .and_then(|revision| revision.members().get(&endpoint_id))
+        .map(String::as_str)
+        .unwrap_or(device_name);
     let members = chain
         .last()
         .map(|revision| revision.members().keys().copied().collect::<Vec<_>>())
@@ -657,7 +772,7 @@ pub fn status_value(
         }
     }
     Ok(json!({
-        "device": { "name": device_name, "endpoint_id": endpoint_id.to_string() },
+        "device": { "name": selected_name, "endpoint_id": endpoint_id.to_string() },
         "daemon": "running",
         "peers": { "known": known, "online": online },
         "files": { "synchronized": files, "degraded": degraded }
@@ -849,6 +964,10 @@ pub enum DaemonError {
     DefaultCollection,
     #[error("collection name must contain from 1 through 255 bytes")]
     InvalidCollectionName,
+    #[error("peer is not in the selected roster")]
+    UnknownPeer,
+    #[error("peer name matches more than one device, use the EndpointID")]
+    AmbiguousPeer,
     #[error(transparent)]
     Notify(#[from] notify::Error),
     #[error(transparent)]
@@ -859,6 +978,8 @@ pub enum DaemonError {
     State(#[from] StateError),
     #[error(transparent)]
     Network(#[from] NetworkError),
+    #[error(transparent)]
+    ProcessLock(#[from] ProcessLockError),
 }
 
 #[cfg(test)]
