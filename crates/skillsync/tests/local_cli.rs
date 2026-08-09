@@ -10,8 +10,11 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use skillsync::config::PlatformPaths;
 use skillsync::daemon::{ControlRequest, send_request};
+use skillsync::identity::DeviceIdentity;
 use skillsync::record::RecordKind;
-use skillsync::state::{CollectionScanStatus, CollectionWatchStatus, StateStore};
+use skillsync::roster::{RosterChange, RosterMember, RosterRevision};
+use skillsync::setup::{load_identity, now_ns};
+use skillsync::state::{CollectionScanStatus, CollectionWatchStatus, OperationalEvent, StateStore};
 
 fn paths(root: &Path) -> PlatformPaths {
     PlatformPaths {
@@ -123,7 +126,7 @@ fn setup_daemon_watch_repair_and_local_cli_work_across_processes() {
     fs::create_dir_all(root.join("config")).unwrap();
     fs::write(
         &platform_paths.config_file,
-        "[device]\nname = \"test-device\"\n[joining.headers]\nAuthorization = \"Bearer secret-value\"\n[sync]\ninterval = \"5s\"\n",
+        "[device]\nname = \"test-device\"\n[joining.headers]\nAuthorization = \"Bearer secret-value\"\n[iroh]\npreset = \"custom\"\nrelay_urls = [\"http://127.0.0.1:9\"]\naddress_lookup_urls = [\"http://127.0.0.1:9/pkarr\"]\n[sync]\ninterval = \"5s\"\n",
     )
     .unwrap();
 
@@ -327,6 +330,127 @@ fn setup_daemon_watch_repair_and_local_cli_work_across_processes() {
             .all(|logs| logs[0]["id"].as_i64() < logs[1]["id"].as_i64())
     );
     assert!(serde_json::to_vec(&page).unwrap().len() < 512 * 1024);
+
+    let unavailable_secret = [70; 32];
+    let unavailable = DeviceIdentity::from_secret(unavailable_secret);
+    let unavailable_endpoint = unavailable.endpoint_id();
+    let (address_sender, address_receiver) = mpsc::channel();
+    let (release_sender, release_receiver) = mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .clear_address_lookup()
+                .relay_mode(iroh::endpoint::RelayMode::Disabled)
+                .secret_key(iroh::SecretKey::from_bytes(&unavailable_secret))
+                .alpns(vec![skillsync::protocol::ALPN.to_vec()])
+                .clear_ip_transports()
+                .bind_addr("127.0.0.1:0")
+                .unwrap()
+                .bind()
+                .await
+                .unwrap();
+            address_sender.send(endpoint.addr()).unwrap();
+            let incoming = endpoint.accept().await.unwrap();
+            let connection = incoming.accept().unwrap().await.unwrap();
+            tokio::task::spawn_blocking(move || release_receiver.recv().unwrap())
+                .await
+                .unwrap();
+            drop(connection);
+            endpoint.close().await;
+        });
+    });
+    let unavailable_addr = address_receiver
+        .recv_timeout(Duration::from_secs(15))
+        .unwrap();
+    let local = load_identity(&platform_paths).unwrap();
+    let mut state = StateStore::open(&database).unwrap();
+    let genesis = state.selected_roster_chain().unwrap()[0].clone();
+    let admission = RosterRevision::child(
+        &genesis,
+        RosterChange::Admit(RosterMember::new(unavailable_endpoint, "unavailable-peer").unwrap()),
+        &local,
+    )
+    .unwrap();
+    state.insert_roster_revision(&admission).unwrap();
+    state
+        .replace_peer_hints(
+            unavailable_endpoint,
+            &[serde_json::to_string(&unavailable_addr).unwrap()],
+            now_ns(),
+        )
+        .unwrap();
+    drop(state);
+
+    let mut waiting_sync = command(root)
+        .args(["sync", "--wait", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let attempt_deadline = Instant::now() + Duration::from_secs(3);
+    let mut saw_attempt = false;
+    while Instant::now() < attempt_deadline {
+        if StateStore::open(&database)
+            .unwrap()
+            .logs()
+            .unwrap()
+            .iter()
+            .any(|log| {
+                matches!(
+                    log.event,
+                    OperationalEvent::PeerAttempted { peer_endpoint }
+                        if peer_endpoint == unavailable_endpoint
+                )
+            })
+        {
+            saw_attempt = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(saw_attempt);
+    assert!(waiting_sync.try_wait().unwrap().is_none());
+    let status_during_sync = json_output(root, &["status", "--json"]);
+    assert_eq!(status_during_sync["daemon"], "running");
+
+    let during_sync = root.join(".agents/skills/during-sync/SKILL.md");
+    fs::create_dir_all(during_sync.parent().unwrap()).unwrap();
+    fs::write(&during_sync, "watch remains live").unwrap();
+    wait_for_hash(
+        &database,
+        ".agents",
+        "during-sync/SKILL.md",
+        *blake3::hash(b"watch remains live").as_bytes(),
+        Duration::from_secs(3),
+    );
+    assert!(waiting_sync.try_wait().unwrap().is_none());
+    release_sender.send(()).unwrap();
+    let waiting_output = waiting_sync.wait_with_output().unwrap();
+    assert!(
+        waiting_output.status.success(),
+        "sync failed: {}",
+        String::from_utf8_lossy(&waiting_output.stderr)
+    );
+    let waiting_result: Value = serde_json::from_slice(&waiting_output.stdout).unwrap();
+    assert_eq!(waiting_result["attempted"], 1);
+    assert_eq!(waiting_result["succeeded"], 0);
+    let peer_logs = StateStore::open(&database).unwrap().logs().unwrap();
+    assert!(peer_logs.iter().any(|log| matches!(
+        log.event,
+        OperationalEvent::PeerUnreachable { peer_endpoint }
+            if peer_endpoint == unavailable_endpoint
+    )));
+    assert!(!peer_logs.iter().any(|log| matches!(
+        log.event,
+        OperationalEvent::PeerRejected { peer_endpoint }
+            if peer_endpoint == unavailable_endpoint
+    )));
+    peer.join().unwrap();
 
     let human = output(root, &["status"]);
     assert!(human.status.success());

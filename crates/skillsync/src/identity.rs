@@ -121,7 +121,7 @@ impl DeviceIdentity {
         self.signing_key.sign(message).to_bytes()
     }
 
-    fn secret_bytes(&self) -> [u8; SECRET_LENGTH] {
+    pub(crate) fn secret_bytes(&self) -> [u8; SECRET_LENGTH] {
         self.signing_key.to_bytes()
     }
 }

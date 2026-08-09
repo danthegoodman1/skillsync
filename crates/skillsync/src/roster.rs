@@ -185,6 +185,13 @@ impl RosterRevision {
     }
 
     pub fn from_canonical(bytes: &[u8]) -> Result<Self, RosterError> {
+        Self::from_canonical_with_member_limit(bytes, usize::MAX)
+    }
+
+    pub fn from_canonical_with_member_limit(
+        bytes: &[u8],
+        max_members: usize,
+    ) -> Result<Self, RosterError> {
         let mut decoder = Decoder::new(bytes, ROSTER_DOMAIN)?;
         let group_id = GroupId::from_bytes(decoder.fixed()?);
         let number = decoder.u64()?;
@@ -195,6 +202,9 @@ impl RosterRevision {
         };
         let member_count = usize::try_from(decoder.u32()?)
             .map_err(|_| CanonicalError::Invalid("member count cannot be represented"))?;
+        if member_count > max_members {
+            return Err(RosterError::MemberLimit);
+        }
         let mut members = BTreeMap::new();
         let mut previous = None;
         for _ in 0..member_count {
@@ -415,6 +425,8 @@ pub enum RosterError {
     NotActive,
     #[error("device name must not be empty")]
     InvalidDeviceName,
+    #[error("roster member count exceeds the receiver limit")]
+    MemberLimit,
     #[error("roster revision number overflowed")]
     RevisionOverflow,
     #[error("roster revision signer is not a valid Ed25519 public key")]

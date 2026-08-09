@@ -202,13 +202,13 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | P3.1: Build configurable persistent iroh endpoints | Missing: endpoint module and N0/custom configuration tests. |
-| Incomplete | Work | P3.2: Implement bounded `skillsync/1` framing and handshake | Missing: codec, protocol limits, and malformed-input tests. |
-| Incomplete | Work | P3.3: Implement symmetric manifest comparison and file transfer | Missing: two-process convergence and corruption tests. |
-| Incomplete | Work | P3.4: Implement reconciliation triggers and peer health reporting | Missing: startup, local-change, explicit, and interval test evidence. |
-| Incomplete | Work | P3.5: Implement degraded-path repair from a reachable winner | Missing: stale local overwrite and repair tests. |
-| Incomplete | Test | Phase 3 peer synchronization test plan | Missing: passing direct, offline, restart, and relay suites. |
-| Incomplete | Gate | Phase 3 completion gate | Missing: repeatable two-daemon end-to-end artifact. |
+| Complete | Work | P3.1: Build configurable persistent iroh endpoints | One persistent identity-bound endpoint supports N0 defaults and custom address lookup and relay configuration. |
+| Complete | Work | P3.2: Implement bounded `skillsync/1` framing and handshake | Versioned frames enforce protocol, path, record, manifest, roster, transfer, hint, and connection limits. |
+| Complete | Work | P3.3: Implement symmetric manifest comparison and file transfer | Concurrent symmetric exchange converges deterministic winners and validates staged bytes before atomic installation. |
+| Complete | Work | P3.4: Implement reconciliation triggers and peer health reporting | Startup, local-change, explicit, and interval triggers are covered with bounded typed health logs. |
+| Complete | Work | P3.5: Implement degraded-path repair from a reachable winner | Repair-only scans request reconciliation and unavailable paths do not block transferable siblings. |
+| Complete | Test | Phase 3 peer synchronization test plan | 101 local tests cover direct and relay paths, online and offline convergence, restart, repair, corruption, interruption, limits, and daemon responsiveness. |
+| In Progress | Gate | Phase 3 completion gate | Implementation and skeptical review are approved. Ubuntu and macOS CI are pending for the pushed phase commit. |
 
 ## Phase 4: Membership and Human Joining
 

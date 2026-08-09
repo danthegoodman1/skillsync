@@ -11,7 +11,7 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use thiserror::Error;
 
 use crate::identity::EndpointId;
-use crate::installer::{AppliedWriteSuppressor, DiskFingerprint};
+use crate::installer::DiskFingerprint;
 use crate::path::{FilenameComparison, LocalPathIndex, PathError, ProtocolPath};
 use crate::record::{Record, RecordKind};
 use crate::root::{StableRoot, StableRootError, open_stable_root_with_hook};
@@ -28,7 +28,6 @@ pub struct Scanner {
     max_future_skew: Duration,
     max_logs: usize,
     comparisons: Mutex<BTreeMap<std::path::PathBuf, FilenameComparison>>,
-    suppressor: AppliedWriteSuppressor,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,6 +42,7 @@ pub struct ScanSummary {
     pub accepted: usize,
     pub tombstones: usize,
     pub rejected: usize,
+    pub repair_required: usize,
     pub paused: bool,
 }
 
@@ -61,7 +61,6 @@ impl Scanner {
             max_future_skew,
             max_logs,
             comparisons: Mutex::new(BTreeMap::new()),
-            suppressor: AppliedWriteSuppressor::default(),
         })
     }
 
@@ -210,6 +209,7 @@ impl Scanner {
                         &event,
                         self.max_logs,
                     )?;
+                    summary.repair_required += 1;
                 } else {
                     self.log(state, observed_ns, event)?;
                 }
@@ -229,14 +229,7 @@ impl Scanner {
                 let durable_match = materialized_fingerprints
                     .get(path.as_str())
                     .is_some_and(|stored| *stored == fingerprint.into());
-                if durable_match
-                    || self.suppressor.consume_if_matches(
-                        &collection.name,
-                        path.as_str(),
-                        fingerprint,
-                    )
-                    || disk_matches_record(disk, &winner)
-                {
+                if durable_match || disk_matches_record(disk, &winner) {
                     state.set_materialized_fingerprint(
                         &collection.name,
                         path.as_str(),
@@ -257,6 +250,7 @@ impl Scanner {
                             &event,
                             self.max_logs,
                         )?;
+                        summary.repair_required += 1;
                     }
                     summary.rejected += 1;
                     continue;
@@ -297,10 +291,6 @@ impl Scanner {
             },
         )?;
         Ok(summary)
-    }
-
-    pub const fn suppressor(&self) -> &AppliedWriteSuppressor {
-        &self.suppressor
     }
 
     fn is_ignored(&self, path: &str) -> bool {
@@ -857,13 +847,14 @@ mod tests {
         .unwrap();
         store.merge_record(&winner, now_ns(), None, 100).unwrap();
 
-        scanner()
+        let summary = scanner()
             .scan_collection(
                 &mut store,
                 &collection(".codex", &root),
                 EndpointId::from_bytes([1; 32]),
             )
             .unwrap();
+        assert_eq!(summary.repair_required, 1);
         assert_eq!(store.record(".codex", "SKILL.md").unwrap(), Some(winner));
         assert_eq!(store.local_counts().unwrap().1, 1);
     }
@@ -901,6 +892,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(summary.rejected, 1);
+        assert_eq!(summary.repair_required, 1);
         assert_eq!(store.record(".agents", "SKILL.md").unwrap(), Some(winner));
         assert_eq!(store.local_counts().unwrap(), (0, 1));
         let state = &store.record_states(".agents").unwrap()[0];
@@ -945,6 +937,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(summary.rejected, 1);
+        assert_eq!(summary.repair_required, 0);
         assert_eq!(store.record(".agents", "UNSEEN.md").unwrap(), None);
         assert!(store.record_states(".agents").unwrap().is_empty());
         assert_eq!(store.local_counts().unwrap(), (0, 0));
@@ -1369,13 +1362,11 @@ mod tests {
         store
             .merge_record(&record, now_ns(), Some(record.author()), 100)
             .unwrap();
-        let initial_scanner = scanner();
         crate::installer::apply_file_fixture(
             &mut store,
             &root,
             &record,
             &mut Cursor::new(bytes),
-            initial_scanner.suppressor(),
             100,
         )
         .unwrap();

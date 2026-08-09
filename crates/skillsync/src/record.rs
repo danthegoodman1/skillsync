@@ -226,10 +226,20 @@ impl Manifest {
     }
 
     pub fn from_canonical(bytes: &[u8]) -> Result<Self, RecordError> {
+        Self::from_canonical_with_limit(bytes, usize::MAX)
+    }
+
+    pub fn from_canonical_with_limit(
+        bytes: &[u8],
+        max_records: usize,
+    ) -> Result<Self, RecordError> {
         let mut decoder = Decoder::new(bytes, MANIFEST_DOMAIN)?;
         let count = usize::try_from(decoder.u32()?)
             .map_err(|_| CanonicalError::Invalid("manifest count cannot be represented"))?;
-        let mut records = Vec::new();
+        if count > max_records {
+            return Err(RecordError::ManifestLimit);
+        }
+        let mut records = Vec::with_capacity(count);
         for _ in 0..count {
             records.push(Record::from_canonical(decoder.sized_bytes()?)?);
         }
@@ -252,6 +262,8 @@ pub enum RecordError {
     FileTooLarge,
     #[error("manifest contains the same collection path more than once")]
     DuplicatePath,
+    #[error("manifest contains more records than the receiver permits")]
+    ManifestLimit,
     #[error(transparent)]
     Canonical(#[from] CanonicalError),
     #[error(transparent)]

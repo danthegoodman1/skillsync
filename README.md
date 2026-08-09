@@ -247,7 +247,8 @@ Git or normal backups when file history matters.
 
 A timestamp too far ahead of the receiving device's clock is rejected and
 reported by `skillsync doctor`. Applied remote files retain the winning write
-time, and watcher suppression recognizes them as synchronized writes.
+time. Scans recognize the durable observed mtime, size, and BLAKE3 fingerprint
+as a synchronized write.
 
 ## CLI and automation
 

@@ -38,6 +38,7 @@ enum Command {
         command: ConfigCommand,
     },
     Logs(LogsArgs),
+    Sync(SyncArgs),
     #[command(name = "__daemon", hide = true)]
     Daemon,
 }
@@ -68,6 +69,12 @@ struct LogsArgs {
     follow: bool,
 }
 
+#[derive(Args)]
+struct SyncArgs {
+    #[arg(long)]
+    wait: bool,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match execute(&cli) {
@@ -95,6 +102,7 @@ fn execute(cli: &Cli) -> Result<(), CliError> {
         Command::Collections { command } => command_collections(&paths, &config, command, cli.json),
         Command::Config { command } => command_config(&paths, &config, command, cli.json),
         Command::Logs(arguments) => command_logs(&paths, arguments, cli.json),
+        Command::Sync(arguments) => command_sync(&paths, arguments, cli.json),
         Command::Daemon => skillsync::daemon::run(paths, config).map_err(CliError::from_error),
     }
 }
@@ -153,7 +161,10 @@ fn command_status(
             "Device   {}",
             value["device"]["name"].as_str().unwrap_or("unknown")
         );
-        println!("Peers    0 online");
+        println!(
+            "Peers    {} online",
+            value["peers"]["online"].as_u64().unwrap_or(0)
+        );
         println!(
             "Files    {} synchronized",
             value["files"]["synchronized"].as_u64().unwrap_or(0)
@@ -347,6 +358,46 @@ fn command_logs(
         }
         io::stdout().flush().map_err(CliError::from_error)?;
         std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    Ok(())
+}
+
+fn command_sync(
+    paths: &PlatformPaths,
+    arguments: &SyncArgs,
+    json_output: bool,
+) -> Result<(), CliError> {
+    let response = send_request(
+        paths,
+        &ControlRequest::Sync {
+            wait: arguments.wait,
+        },
+    )
+    .map_err(|error| match error {
+        DaemonError::Io(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            CliError::new("daemon_not_running", "the skillsync daemon is not running")
+        }
+        error => CliError::from_error(error),
+    })?;
+    if !response.ok {
+        return Err(response_error(response));
+    }
+    let value = response.result.expect("successful response has a result");
+    if json_output {
+        print_json(&value);
+    } else if arguments.wait {
+        println!(
+            "Synchronized with {} of {} peers.",
+            value["succeeded"].as_u64().unwrap_or(0),
+            value["attempted"].as_u64().unwrap_or(0)
+        );
+    } else {
+        println!("Synchronization queued.");
     }
     Ok(())
 }

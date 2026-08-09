@@ -257,7 +257,8 @@ follows this shape:
    and attached collection names.
 3. Unknown, removed, or wrong-group identities are refused unless the
    connection carries the inviter's active join capability.
-4. Approved peers exchange the current roster when their digests differ.
+4. Approved peers exchange complete signed roster chains and deterministically
+   select the current chain.
 5. For every collection attached at both ends, peers exchange complete
    manifests.
 6. Each side deterministically selects winning records and requests missing
@@ -277,13 +278,16 @@ offline.
 The receiver validates membership, path, timestamp, declared size, and
 configured limits before accepting bytes. It then:
 
-1. streams content into a temporary file inside the destination collection
+1. streams content into a bounded staging file in the skillsync data directory
 2. computes BLAKE3 while receiving
 3. rejects a size or hash mismatch
-4. applies the winning filesystem write time to the temporary file
-5. flushes and synchronizes the completed temporary file
-6. atomically renames it over the destination
-7. synchronizes the destination directory
+4. copies validated content into a temporary file inside the destination
+   collection
+5. applies the winning filesystem write time to the collection-local temporary
+   file
+6. flushes and synchronizes the completed temporary file
+7. atomically renames it over the destination
+8. synchronizes the destination directory
 
 New destination directories are synchronized as they are created.
 

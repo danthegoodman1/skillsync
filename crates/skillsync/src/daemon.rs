@@ -4,7 +4,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use notify::{Config as NotifyConfig, PollWatcher, RecursiveMode, Watcher};
@@ -13,8 +13,9 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::config::{Config, PlatformPaths};
-use crate::filesystem::{ScanError, Scanner};
+use crate::filesystem::{ScanError, ScanSummary, Scanner};
 use crate::identity::EndpointId;
+use crate::network::{NetworkError, NetworkHandle};
 use crate::setup::{DEFAULT_COLLECTIONS, load_identity, now_ns, setup};
 use crate::state::{
     CollectionScanStatus, CollectionWatchStatus, OperationalEvent, OperationalLog,
@@ -25,6 +26,8 @@ const SOCKET_FILE: &str = "control.sock";
 const REQUEST_LIMIT: usize = 64 * 1024;
 const RESPONSE_LIMIT: usize = 512 * 1024;
 const LOG_PAGE_LIMIT: usize = 64;
+const MAX_PENDING_SYNC_WAITS: usize = 8;
+const SYNC_WAIT_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
@@ -45,6 +48,11 @@ pub enum ControlRequest {
         limit: usize,
     },
     Scan,
+    Sync {
+        #[serde(default)]
+        wait: bool,
+    },
+    EndpointAddr,
     Shutdown,
 }
 
@@ -97,7 +105,7 @@ pub fn send_request(
     request: &ControlRequest,
 ) -> Result<ControlResponse, DaemonError> {
     let mut stream = UnixStream::connect(socket_path(paths))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(50)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let request = serde_json::to_vec(request)?;
     if request.len() > REQUEST_LIMIT {
@@ -148,11 +156,14 @@ pub fn run(paths: PlatformPaths, config: Config) -> Result<(), DaemonError> {
 
     let watch_inbox = WatchInbox::default();
     let mut watchers = build_watchers(&mut state, watch_inbox.clone(), config.logging.max_entries)?;
+    let network = NetworkHandle::start(paths.clone(), config.clone(), identity)?;
     let mut pending = BTreeSet::new();
+    let mut pending_syncs = Vec::new();
     let mut next_full_scan = Instant::now() + config.sync.interval;
     let mut running = true;
 
     while running {
+        finish_pending_syncs(&mut pending_syncs);
         drain_watch_events(
             &watch_inbox,
             &mut pending,
@@ -160,8 +171,10 @@ pub fn run(paths: PlatformPaths, config: Config) -> Result<(), DaemonError> {
             config.logging.max_entries,
         )?;
         for name in std::mem::take(&mut pending) {
-            if let Some(collection) = state.collection(&name)? {
-                scan_collection_safely(&scanner, &mut state, &collection, endpoint_id)?;
+            if let Some(collection) = state.collection(&name)?
+                && scan_collection_safely(&scanner, &mut state, &collection, endpoint_id)?
+            {
+                network.trigger();
             }
         }
 
@@ -169,10 +182,44 @@ pub fn run(paths: PlatformPaths, config: Config) -> Result<(), DaemonError> {
             match listener.accept() {
                 Ok((stream, _)) => {
                     let request = read_request(&stream);
-                    let (response, action) = match request {
-                        Ok(request) => {
-                            handle_request(request, &config, &scanner, &mut state, endpoint_id)
+                    if matches!(request, Ok(ControlRequest::Sync { wait: true })) {
+                        if pending_syncs.len() == MAX_PENDING_SYNC_WAITS {
+                            let _ = write_response(
+                                stream,
+                                &ControlResponse::failure(
+                                    "daemon_operation_failed",
+                                    "too many synchronization waits are active",
+                                ),
+                            );
+                        } else {
+                            match network.start_sync() {
+                                Ok(completed) => pending_syncs.push(PendingSync {
+                                    stream,
+                                    completed,
+                                    deadline: Instant::now() + SYNC_WAIT_TIMEOUT,
+                                }),
+                                Err(error) => {
+                                    let _ = write_response(
+                                        stream,
+                                        &ControlResponse::failure(
+                                            "daemon_operation_failed",
+                                            error.to_string(),
+                                        ),
+                                    );
+                                }
+                            }
                         }
+                        continue;
+                    }
+                    let (response, action) = match request {
+                        Ok(request) => handle_request(
+                            request,
+                            &config,
+                            &scanner,
+                            &mut state,
+                            endpoint_id,
+                            &network,
+                        ),
                         Err(error) => (
                             ControlResponse::failure("invalid_request", error.to_string()),
                             DaemonAction::None,
@@ -187,7 +234,9 @@ pub fn run(paths: PlatformPaths, config: Config) -> Result<(), DaemonError> {
                                 watch_inbox.clone(),
                                 config.logging.max_entries,
                             )?;
+                            network.trigger();
                         }
+                        DaemonAction::TriggerNetwork => network.trigger(),
                         DaemonAction::Stop => running = false,
                     }
                 }
@@ -197,7 +246,9 @@ pub fn run(paths: PlatformPaths, config: Config) -> Result<(), DaemonError> {
         }
 
         if Instant::now() >= next_full_scan {
-            scan_all(&scanner, &mut state, endpoint_id)?;
+            if scan_all(&scanner, &mut state, endpoint_id)? {
+                network.trigger();
+            }
             watchers = build_watchers(&mut state, watch_inbox.clone(), config.logging.max_entries)?;
             next_full_scan = Instant::now() + config.sync.interval;
         }
@@ -206,6 +257,8 @@ pub fn run(paths: PlatformPaths, config: Config) -> Result<(), DaemonError> {
         std::thread::sleep(Duration::from_millis(25));
     }
 
+    fail_pending_syncs(&mut pending_syncs);
+    network.shutdown()?;
     state.append_log(
         now_ns(),
         &OperationalEvent::DaemonStopped,
@@ -223,6 +276,7 @@ fn read_request(stream: &UnixStream) -> Result<ControlRequest, DaemonError> {
 }
 
 fn write_response(mut stream: UnixStream, response: &ControlResponse) -> Result<(), DaemonError> {
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let mut encoded = serde_json::to_vec(response)?;
     if encoded.len() > RESPONSE_LIMIT {
         encoded = serde_json::to_vec(&ControlResponse::failure(
@@ -261,7 +315,57 @@ fn read_frame(reader: &mut impl BufRead, limit: usize) -> Result<Vec<u8>, Daemon
 enum DaemonAction {
     None,
     RebuildWatchers,
+    TriggerNetwork,
     Stop,
+}
+
+struct PendingSync {
+    stream: UnixStream,
+    completed: mpsc::Receiver<crate::network::SyncSummary>,
+    deadline: Instant,
+}
+
+fn finish_pending_syncs(pending: &mut Vec<PendingSync>) {
+    let mut index = 0;
+    while index < pending.len() {
+        let response = match pending[index].completed.try_recv() {
+            Ok(summary) => Some(ControlResponse::success(json!({
+                "queued": true,
+                "completed": true,
+                "attempted": summary.attempted,
+                "succeeded": summary.succeeded
+            }))),
+            Err(mpsc::TryRecvError::Disconnected) => Some(ControlResponse::failure(
+                "daemon_operation_failed",
+                NetworkError::Stopped.to_string(),
+            )),
+            Err(mpsc::TryRecvError::Empty) if Instant::now() >= pending[index].deadline => {
+                Some(ControlResponse::failure(
+                    "daemon_operation_failed",
+                    NetworkError::SyncTimeout.to_string(),
+                ))
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+        };
+        if let Some(response) = response {
+            let waiter = pending.remove(index);
+            let _ = write_response(waiter.stream, &response);
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn fail_pending_syncs(pending: &mut Vec<PendingSync>) {
+    for waiter in pending.drain(..) {
+        let _ = write_response(
+            waiter.stream,
+            &ControlResponse::failure(
+                "daemon_operation_failed",
+                "daemon stopped before synchronization completed",
+            ),
+        );
+    }
 }
 
 fn handle_request(
@@ -270,6 +374,7 @@ fn handle_request(
     scanner: &Scanner,
     state: &mut StateStore,
     endpoint_id: EndpointId,
+    network: &NetworkHandle,
 ) -> (ControlResponse, DaemonAction) {
     let result = match request {
         ControlRequest::Status => status_value(state, &config.device.name, endpoint_id)
@@ -303,6 +408,17 @@ fn handle_request(
         ControlRequest::Scan => scan_all(scanner, state, endpoint_id)
             .and_then(|_| status_value(state, &config.device.name, endpoint_id))
             .map(|value| (value, DaemonAction::RebuildWatchers)),
+        ControlRequest::Sync { wait: false } => Ok((
+            json!({ "queued": true, "completed": false }),
+            DaemonAction::TriggerNetwork,
+        )),
+        ControlRequest::Sync { wait: true } => Err(DaemonError::Protocol(
+            "synchronous request was not deferred by the control loop",
+        )),
+        ControlRequest::EndpointAddr => network
+            .endpoint_addr_json()
+            .map(|address| (json!({ "address": address }), DaemonAction::None))
+            .map_err(DaemonError::from),
         ControlRequest::Shutdown => Ok((json!({ "stopped": true }), DaemonAction::Stop)),
     };
     match result {
@@ -318,11 +434,12 @@ fn scan_all(
     scanner: &Scanner,
     state: &mut StateStore,
     endpoint_id: EndpointId,
-) -> Result<(), DaemonError> {
+) -> Result<bool, DaemonError> {
+    let mut changed = false;
     for collection in state.collections()? {
-        scan_collection_safely(scanner, state, &collection, endpoint_id)?;
+        changed |= scan_collection_safely(scanner, state, &collection, endpoint_id)?;
     }
-    Ok(())
+    Ok(changed)
 }
 
 fn scan_collection_safely(
@@ -330,21 +447,25 @@ fn scan_collection_safely(
     state: &mut StateStore,
     collection: &crate::state::CollectionState,
     endpoint_id: EndpointId,
-) -> Result<(), DaemonError> {
-    if scanner
-        .scan_collection(state, collection, endpoint_id)
-        .is_err()
-    {
-        state.set_collection_scan_status(&collection.name, CollectionScanStatus::Error)?;
-        state.append_log(
-            now_ns(),
-            &OperationalEvent::CollectionPaused {
-                collection: collection.name.clone(),
-            },
-            scanner.max_logs(),
-        )?;
+) -> Result<bool, DaemonError> {
+    match scanner.scan_collection(state, collection, endpoint_id) {
+        Ok(summary) => Ok(scan_requires_network(&summary)),
+        Err(_) => {
+            state.set_collection_scan_status(&collection.name, CollectionScanStatus::Error)?;
+            state.append_log(
+                now_ns(),
+                &OperationalEvent::CollectionPaused {
+                    collection: collection.name.clone(),
+                },
+                scanner.max_logs(),
+            )?;
+            Ok(false)
+        }
     }
-    Ok(())
+}
+
+fn scan_requires_network(summary: &ScanSummary) -> bool {
+    summary.accepted > 0 || summary.tombstones > 0 || summary.repair_required > 0
 }
 
 fn build_watchers(
@@ -523,10 +644,22 @@ pub fn status_value(
     endpoint_id: EndpointId,
 ) -> Result<Value, DaemonError> {
     let (files, degraded) = state.local_counts()?;
+    let chain = state.selected_roster_chain()?;
+    let members = chain
+        .last()
+        .map(|revision| revision.members().keys().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let known = members.iter().filter(|peer| **peer != endpoint_id).count();
+    let mut online = 0_usize;
+    for peer in members.into_iter().filter(|peer| *peer != endpoint_id) {
+        if state.peer_reachable(peer)? {
+            online += 1;
+        }
+    }
     Ok(json!({
         "device": { "name": device_name, "endpoint_id": endpoint_id.to_string() },
         "daemon": "running",
-        "peers": { "known": 0, "online": 0 },
+        "peers": { "known": known, "online": online },
         "files": { "synchronized": files, "degraded": degraded }
     }))
 }
@@ -635,6 +768,31 @@ fn log_value(log: &OperationalLog) -> Value {
         OperationalEvent::PeerUnreachable { peer_endpoint } => {
             object.insert("peer_endpoint".to_owned(), json!(peer_endpoint.to_string()));
         }
+        OperationalEvent::PeerAttempted { peer_endpoint }
+        | OperationalEvent::PeerSynchronized { peer_endpoint }
+        | OperationalEvent::PeerRejected { peer_endpoint }
+        | OperationalEvent::PeerSessionFailed { peer_endpoint } => {
+            object.insert("peer_endpoint".to_owned(), json!(peer_endpoint.to_string()));
+        }
+        OperationalEvent::FileSent {
+            collection,
+            path,
+            peer_endpoint,
+        }
+        | OperationalEvent::FileReceived {
+            collection,
+            path,
+            peer_endpoint,
+        }
+        | OperationalEvent::TransferRejected {
+            collection,
+            path,
+            peer_endpoint,
+        } => {
+            object.insert("collection".to_owned(), json!(collection));
+            object.insert("path".to_owned(), json!(path.as_str()));
+            object.insert("peer_endpoint".to_owned(), json!(peer_endpoint.to_string()));
+        }
         OperationalEvent::StateOpened
         | OperationalEvent::DaemonStarted
         | OperationalEvent::DaemonStopped => {}
@@ -663,6 +821,13 @@ fn event_name(event: &OperationalEvent) -> &'static str {
         OperationalEvent::FileApplyRejected { .. } => "file_apply_rejected",
         OperationalEvent::RepairRequired { .. } => "repair_required",
         OperationalEvent::PeerUnreachable { .. } => "peer_unreachable",
+        OperationalEvent::PeerAttempted { .. } => "peer_attempted",
+        OperationalEvent::PeerSynchronized { .. } => "peer_synchronized",
+        OperationalEvent::PeerRejected { .. } => "peer_rejected",
+        OperationalEvent::PeerSessionFailed { .. } => "peer_session_failed",
+        OperationalEvent::FileSent { .. } => "file_sent",
+        OperationalEvent::FileReceived { .. } => "file_received",
+        OperationalEvent::TransferRejected { .. } => "transfer_rejected",
     }
 }
 
@@ -692,6 +857,8 @@ pub enum DaemonError {
     Scan(#[from] ScanError),
     #[error(transparent)]
     State(#[from] StateError),
+    #[error(transparent)]
+    Network(#[from] NetworkError),
 }
 
 #[cfg(test)]
@@ -743,5 +910,49 @@ mod tests {
         let response: ControlResponse = serde_json::from_slice(&encoded).unwrap();
         assert!(!response.ok);
         assert_eq!(response.error.unwrap().code, "response_too_large");
+    }
+
+    #[test]
+    fn a_repair_only_scan_requests_network_reconciliation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("skills");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("SKILL.md"), b"disk loser").unwrap();
+        let mut state = StateStore::open_in_memory().unwrap();
+        state.add_collection(".agents", &root, Some(&root)).unwrap();
+        let remote = EndpointId::from_bytes([7; 32]);
+        let winner = crate::record::Record::file(
+            ".agents",
+            crate::path::ProtocolPath::parse("SKILL.md").unwrap(),
+            now_ns().saturating_add(1_000_000_000),
+            remote,
+            6,
+            *blake3::hash(b"winner").as_bytes(),
+        )
+        .unwrap();
+        state
+            .merge_record(&winner, now_ns(), Some(remote), 100)
+            .unwrap();
+        let collection = state.collection(".agents").unwrap().unwrap();
+        let scanner = Scanner::new(&[], Duration::from_secs(300), 100).unwrap();
+
+        assert!(
+            scan_collection_safely(
+                &scanner,
+                &mut state,
+                &collection,
+                EndpointId::from_bytes([8; 32])
+            )
+            .unwrap()
+        );
+        let record = state.record_states(".agents").unwrap().remove(0);
+        assert!(record.needs_repair);
+        assert!(
+            state
+                .logs()
+                .unwrap()
+                .iter()
+                .any(|log| matches!(log.event, OperationalEvent::RepairRequired { .. }))
+        );
     }
 }

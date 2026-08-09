@@ -1,10 +1,7 @@
-use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
 
 use cap_std::fs::{Dir, OpenOptions};
 use filetime::FileTime;
@@ -51,52 +48,6 @@ pub struct InstalledFile {
     pub path: PathBuf,
     pub resolved_root: PathBuf,
     pub fingerprint: DiskFingerprint,
-}
-
-struct SuppressionEntry {
-    fingerprint: DiskFingerprint,
-    expires: Instant,
-}
-
-#[derive(Default)]
-pub struct AppliedWriteSuppressor {
-    entries: Mutex<BTreeMap<(String, String), SuppressionEntry>>,
-}
-
-impl AppliedWriteSuppressor {
-    pub fn remember(&self, record: &Record, fingerprint: DiskFingerprint) {
-        self.remember_for(record, fingerprint, Duration::from_secs(5));
-    }
-
-    fn remember_for(&self, record: &Record, fingerprint: DiskFingerprint, ttl: Duration) {
-        self.entries
-            .lock()
-            .expect("suppression lock poisoned")
-            .insert(
-                (
-                    record.collection().to_owned(),
-                    record.path().as_str().to_owned(),
-                ),
-                SuppressionEntry {
-                    fingerprint,
-                    expires: Instant::now() + ttl,
-                },
-            );
-    }
-
-    pub fn consume_if_matches(
-        &self,
-        collection: &str,
-        path: &str,
-        fingerprint: DiskFingerprint,
-    ) -> bool {
-        let key = (collection.to_owned(), path.to_owned());
-        let mut entries = self.entries.lock().expect("suppression lock poisoned");
-        let Some(entry) = entries.remove(&key) else {
-            return false;
-        };
-        entry.expires >= Instant::now() && entry.fingerprint == fingerprint
-    }
 }
 
 pub fn install_file(
@@ -208,18 +159,92 @@ pub fn apply_file_fixture(
     root: &Path,
     record: &Record,
     reader: &mut impl Read,
-    suppressor: &AppliedWriteSuppressor,
     max_logs: usize,
 ) -> Result<InstalledFile, InstallError> {
-    apply_file_fixture_with_hook(
-        state,
-        root,
-        record,
-        reader,
-        suppressor,
+    apply_file_fixture_with_hook(state, root, record, reader, max_logs, |_| Ok(()))
+}
+
+pub fn open_verified_file(root: &Path, record: &Record) -> Result<fs::File, InstallError> {
+    let (declared_size, declared_hash) = match record.kind() {
+        RecordKind::File { size, content_hash } => (size, content_hash),
+        RecordKind::Tombstone => return Err(InstallError::Tombstone),
+    };
+    let StableRoot {
+        directory: root_dir,
+        ..
+    } = match open_stable_root_with_hook(root, &mut || Ok(())) {
+        Ok(root) => root,
+        Err(StableRootError::Io(error)) => return Err(error.into()),
+        Err(StableRootError::Unstable) => return Err(InstallError::UnstableRoot),
+    };
+    let relative = Path::new(record.path().as_str());
+    let parent_relative = relative.parent().unwrap_or_else(|| Path::new(""));
+    if open_existing_safe_parent(&root_dir, parent_relative)?.is_none() {
+        return Err(InstallError::UnsafeDestination);
+    }
+    let mut file = root_dir.open(relative)?.into_std();
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() != declared_size {
+        return Err(InstallError::SizeMismatch);
+    }
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if hasher.finalize().as_bytes() != &declared_hash {
+        return Err(InstallError::HashMismatch);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    Ok(file)
+}
+
+pub fn materialize_tombstone(
+    state: &mut StateStore,
+    root: &Path,
+    record: &Record,
+    max_logs: usize,
+) -> Result<(), InstallError> {
+    if !matches!(record.kind(), RecordKind::Tombstone) {
+        return Err(InstallError::NotTombstone);
+    }
+    let StableRoot {
+        directory: root_dir,
+        ..
+    } = match open_stable_root_with_hook(root, &mut || Ok(())) {
+        Ok(root) => root,
+        Err(StableRootError::Io(error)) => return Err(error.into()),
+        Err(StableRootError::Unstable) => return Err(InstallError::UnstableRoot),
+    };
+    let relative = Path::new(record.path().as_str());
+    let parent_relative = relative.parent().unwrap_or_else(|| Path::new(""));
+    if let Some(parent) = open_existing_safe_parent(&root_dir, parent_relative)? {
+        let file_name = relative
+            .file_name()
+            .ok_or(InstallError::UnsafeDestination)?;
+        match parent.remove_file(file_name) {
+            Ok(()) => {
+                sync_dir(&parent)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    state.mark_tombstone_materialized_and_log(
+        record.collection(),
+        record.path().as_str(),
+        now_ns(),
+        &OperationalEvent::FileInstalled {
+            collection: record.collection().to_owned(),
+            path: record.path().clone(),
+        },
         max_logs,
-        |_| Ok(()),
-    )
+    )?;
+    Ok(())
 }
 
 fn apply_file_fixture_with_hook(
@@ -227,13 +252,11 @@ fn apply_file_fixture_with_hook(
     root: &Path,
     record: &Record,
     reader: &mut impl Read,
-    suppressor: &AppliedWriteSuppressor,
     max_logs: usize,
     hook: impl FnMut(InstallStage) -> io::Result<()>,
 ) -> Result<InstalledFile, InstallError> {
     match install_file_with_hook(root, record, reader, hook) {
         Ok(installed) => {
-            suppressor.remember(record, installed.fingerprint);
             let event = OperationalEvent::FileInstalled {
                 collection: record.collection().to_owned(),
                 path: record.path().clone(),
@@ -258,7 +281,6 @@ fn apply_file_fixture_with_hook(
         }
         Err(InstallError::PostRenameDurability { installed, source }) => {
             let installed = *installed;
-            suppressor.remember(record, installed.fingerprint);
             let event = OperationalEvent::FileApplyRejected {
                 collection: record.collection().to_owned(),
                 path: record.path().clone(),
@@ -333,6 +355,24 @@ fn ensure_safe_parent(
         }
     }
     Ok(())
+}
+
+fn open_existing_safe_parent(root: &Dir, relative: &Path) -> Result<Option<Dir>, InstallError> {
+    let mut current = root.try_clone()?;
+    let mut logical = PathBuf::new();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(InstallError::UnsafeDestination);
+        };
+        logical.push(component);
+        if !exact_entry_exists(&current, component)? {
+            return Ok(None);
+        }
+        current = root
+            .open_dir(&logical)
+            .map_err(|_| InstallError::UnsafeDestination)?;
+    }
+    Ok(Some(current))
 }
 
 fn sync_dir(directory: &Dir) -> io::Result<()> {
@@ -417,6 +457,8 @@ pub enum InstallError {
     Io(#[from] io::Error),
     #[error("a tombstone has no file bytes to install")]
     Tombstone,
+    #[error("a file record cannot be materialized as a tombstone")]
+    NotTombstone,
     #[error("destination escapes the collection root")]
     UnsafeDestination,
     #[error("destination name collides on the collection filesystem")]
@@ -451,6 +493,7 @@ pub enum InstallError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::io::Cursor;
     use std::os::unix::fs::symlink;
     use std::sync::Arc;
@@ -582,6 +625,60 @@ mod tests {
     }
 
     #[test]
+    fn tombstone_materialization_does_not_create_missing_parents_or_follow_symlinks() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("skills");
+        let outside = temporary.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("SKILL.md"), b"outside").unwrap();
+        let database = temporary.path().join("state.sqlite3");
+        let mut state = StateStore::open(&database).unwrap();
+        state.add_collection(".agents", &root, Some(&root)).unwrap();
+
+        let missing = Record::tombstone(
+            ".agents",
+            crate::path::ProtocolPath::parse("missing/SKILL.md").unwrap(),
+            10,
+            EndpointId::from_bytes([9; 32]),
+        )
+        .unwrap();
+        state
+            .merge_record(&missing, 10, Some(EndpointId::from_bytes([9; 32])), 100)
+            .unwrap();
+        materialize_tombstone(&mut state, &root, &missing, 100).unwrap();
+        assert!(!root.join("missing").exists());
+        let missing_state = state.record_states(".agents").unwrap().remove(0);
+        assert!(missing_state.materialized);
+        assert!(!missing_state.needs_repair);
+
+        symlink(&outside, root.join("linked")).unwrap();
+        let linked = Record::tombstone(
+            ".agents",
+            crate::path::ProtocolPath::parse("linked/SKILL.md").unwrap(),
+            20,
+            EndpointId::from_bytes([9; 32]),
+        )
+        .unwrap();
+        state
+            .merge_record(&linked, 20, Some(EndpointId::from_bytes([9; 32])), 100)
+            .unwrap();
+        assert!(matches!(
+            materialize_tombstone(&mut state, &root, &linked, 100),
+            Err(InstallError::UnsafeDestination)
+        ));
+        assert_eq!(fs::read(outside.join("SKILL.md")).unwrap(), b"outside");
+        let linked_state = state
+            .record_states(".agents")
+            .unwrap()
+            .into_iter()
+            .find(|item| item.record == linked)
+            .unwrap();
+        assert!(!linked_state.materialized);
+        assert!(linked_state.needs_repair);
+    }
+
+    #[test]
     fn every_pre_rename_fault_keeps_the_previous_file_visible() {
         for stage in [
             InstallStage::BeforeWrite,
@@ -693,7 +790,6 @@ mod tests {
             temporary.path(),
             &candidate,
             &mut Cursor::new(b"replacement"),
-            &AppliedWriteSuppressor::default(),
             100,
         );
         let Err(InstallError::PostRenameState { installed, .. }) = result else {
@@ -759,8 +855,6 @@ mod tests {
         state
             .merge_record(&candidate, 10, Some(candidate.author()), 100)
             .unwrap();
-        let suppressor = AppliedWriteSuppressor::default();
-
         let running = Arc::new(AtomicBool::new(true));
         let thread_running = Arc::clone(&running);
         let thread_link = root_link.clone();
@@ -797,7 +891,6 @@ mod tests {
                 &root_link,
                 &candidate,
                 &mut Cursor::new(bytes),
-                &suppressor,
                 100,
             ) {
                 Ok(result) => {
@@ -853,7 +946,6 @@ mod tests {
             &root_link,
             &candidate,
             &mut Cursor::new(bytes),
-            &suppressor,
             100,
             |stage| {
                 if stage == InstallStage::DuringRootAcquisition && !retargeted {
@@ -885,7 +977,6 @@ mod tests {
             &root_link,
             &candidate,
             &mut Cursor::new(bytes),
-            &suppressor,
             100,
         )
         .unwrap();
@@ -948,7 +1039,6 @@ mod tests {
             &root_link,
             &candidate,
             &mut Cursor::new(bytes),
-            &AppliedWriteSuppressor::default(),
             100,
             |stage| {
                 if stage == InstallStage::BeforeWrite {
@@ -1002,7 +1092,6 @@ mod tests {
             &root_link,
             &candidate,
             &mut Cursor::new(bytes),
-            &AppliedWriteSuppressor::default(),
             100,
             |stage| {
                 match stage {
@@ -1127,48 +1216,6 @@ mod tests {
     }
 
     #[test]
-    fn watcher_suppression_is_single_use_and_record_specific() {
-        let suppressor = AppliedWriteSuppressor::default();
-        let applied = record(b"one", 10);
-        let other = Record::file(
-            ".agents",
-            crate::path::ProtocolPath::parse("other/SKILL.md").unwrap(),
-            10,
-            EndpointId::from_bytes([3; 32]),
-            3,
-            *blake3::hash(b"two").as_bytes(),
-        )
-        .unwrap();
-        let fingerprint = DiskFingerprint {
-            modified_ns: 9,
-            size: 3,
-            hash: *blake3::hash(b"one").as_bytes(),
-        };
-        suppressor.remember(&applied, fingerprint);
-        assert!(!suppressor.consume_if_matches(
-            other.collection(),
-            other.path().as_str(),
-            fingerprint
-        ));
-        assert!(suppressor.consume_if_matches(
-            applied.collection(),
-            applied.path().as_str(),
-            fingerprint
-        ));
-        assert!(!suppressor.consume_if_matches(
-            applied.collection(),
-            applied.path().as_str(),
-            fingerprint
-        ));
-        suppressor.remember_for(&applied, fingerprint, Duration::ZERO);
-        assert!(!suppressor.consume_if_matches(
-            applied.collection(),
-            applied.path().as_str(),
-            fingerprint
-        ));
-    }
-
-    #[test]
     fn failed_winner_install_marks_repair_and_logs_rejection() {
         let temporary = tempfile::tempdir().unwrap();
         let mut state = StateStore::open_in_memory().unwrap();
@@ -1177,15 +1224,12 @@ mod tests {
             .unwrap();
         let winner = record(b"expected", 10);
         state.merge_record(&winner, 10, None, 100).unwrap();
-        let suppressor = AppliedWriteSuppressor::default();
-
         assert!(matches!(
             apply_file_fixture(
                 &mut state,
                 temporary.path(),
                 &winner,
                 &mut Cursor::new(b"corrupt!"),
-                &suppressor,
                 100,
             ),
             Err(InstallError::HashMismatch)

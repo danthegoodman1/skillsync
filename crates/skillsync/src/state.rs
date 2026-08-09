@@ -12,7 +12,9 @@ use crate::path::{PathError, ProtocolPath};
 use crate::record::{Record, RecordError};
 use crate::roster::{RosterError, RosterHash, RosterRevision, select_chain};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 6;
+const MAX_PEER_HINTS: usize = 32;
+const MAX_PEER_HINT_BYTES: usize = 16 * 1024;
 
 pub struct StateStore {
     connection: Connection,
@@ -367,6 +369,34 @@ impl StateStore {
         Ok(selected)
     }
 
+    pub fn merge_selected_roster_chain(
+        &mut self,
+        revisions: &[RosterRevision],
+    ) -> Result<(), StateError> {
+        let Some(remote_genesis) = revisions.first() else {
+            return Err(StateError::RosterTopology("remote roster is empty"));
+        };
+        remote_genesis.validate_genesis()?;
+        for pair in revisions.windows(2) {
+            pair[1].validate_child(&pair[0])?;
+        }
+        let local = self.selected_roster_chain()?;
+        let Some(local_genesis) = local.first() else {
+            return Err(StateError::RosterTopology(
+                "local roster genesis is missing",
+            ));
+        };
+        if remote_genesis.canonical_hash() != local_genesis.canonical_hash() {
+            return Err(StateError::RosterTopology("remote roster genesis differs"));
+        }
+        for revision in revisions.iter().skip(1) {
+            if self.roster_revision(revision.canonical_hash())?.is_none() {
+                self.insert_roster_revision(revision)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn merge_record(
         &mut self,
         record: &Record,
@@ -382,8 +412,7 @@ impl StateStore {
             .as_ref()
             .is_none_or(|current| record.compare_winner(current).is_gt());
         if accepted {
-            let materialized = source_peer.is_none()
-                || matches!(record.kind(), crate::record::RecordKind::Tombstone);
+            let materialized = source_peer.is_none();
             upsert_record(&transaction, record, materialized)?;
         }
         let event = match current {
@@ -406,6 +435,21 @@ impl StateStore {
         insert_log(&transaction, observed_ns, &event, max_logs)?;
         transaction.commit()?;
         Ok(accepted)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_materialized_records_for_test(
+        &mut self,
+        records: &[Record],
+    ) -> Result<(), StateError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for record in records {
+            upsert_record(&transaction, record, true)?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn record(&self, collection: &str, path: &str) -> Result<Option<Record>, StateError> {
@@ -438,39 +482,26 @@ impl StateStore {
                     materialized_modified_ns, materialized_size, materialized_hash
              FROM path_records WHERE collection = ?1 ORDER BY path",
         )?;
-        let rows = statement.query_map([collection], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, bool>(2)?,
-                row.get::<_, bool>(3)?,
-                row.get::<_, Option<i64>>(4)?,
-                row.get::<_, Option<i64>>(5)?,
-                row.get::<_, Option<Vec<u8>>>(6)?,
-            ))
-        })?;
-        rows.map(|row| {
-            let (
-                hash,
-                canonical,
-                materialized,
-                needs_repair,
-                materialized_modified_ns,
-                materialized_size,
-                materialized_hash,
-            ) = row?;
-            Ok(PathRecordState {
-                record: decode_stored_record((hash, canonical))?,
-                materialized,
-                needs_repair,
-                materialized_fingerprint: decode_materialized_fingerprint(
-                    materialized_modified_ns,
-                    materialized_size,
-                    materialized_hash,
-                )?,
-            })
-        })
-        .collect()
+        let rows = statement.query_map([collection], stored_path_record_state)?;
+        rows.map(|row| decode_path_record_state(row?)).collect()
+    }
+
+    pub fn record_state(
+        &self,
+        collection: &str,
+        path: &str,
+    ) -> Result<Option<PathRecordState>, StateError> {
+        let stored = self
+            .connection
+            .query_row(
+                "SELECT record_hash, canonical, materialized, needs_repair,
+                        materialized_modified_ns, materialized_size, materialized_hash
+                 FROM path_records WHERE collection = ?1 AND path = ?2",
+                params![collection, path],
+                stored_path_record_state,
+            )
+            .optional()?;
+        stored.map(decode_path_record_state).transpose()
     }
 
     pub fn set_repair_required(
@@ -578,6 +609,30 @@ impl StateStore {
         Ok(())
     }
 
+    pub fn mark_tombstone_materialized_and_log(
+        &mut self,
+        collection: &str,
+        path: &str,
+        created_ns: i64,
+        event: &OperationalEvent,
+        max_logs: usize,
+    ) -> Result<(), StateError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = transaction.execute(
+            "UPDATE path_records SET materialized = 1, needs_repair = 0
+             WHERE collection = ?1 AND path = ?2 AND kind = 0",
+            params![collection, path],
+        )?;
+        if updated != 1 {
+            return Err(StateError::MissingPathRecord);
+        }
+        insert_log(&transaction, created_ns, event, max_logs)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn reject_future_log_inserts(&self) -> Result<(), StateError> {
         self.connection.execute_batch(
@@ -594,7 +649,7 @@ impl StateStore {
         let (files, degraded): (i64, i64) = self.connection.query_row(
             "SELECT
                 coalesce(sum(CASE WHEN kind = 1 AND materialized = 1 THEN 1 ELSE 0 END), 0),
-                coalesce(sum(CASE WHEN kind = 1 AND materialized = 0 THEN 1 ELSE 0 END), 0)
+                coalesce(sum(CASE WHEN needs_repair = 1 THEN 1 ELSE 0 END), 0)
              FROM path_records",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -603,21 +658,6 @@ impl StateStore {
             u64::try_from(files).map_err(|_| StateError::NumberOverflow)?,
             u64::try_from(degraded).map_err(|_| StateError::NumberOverflow)?,
         ))
-    }
-
-    pub fn upsert_peer_hint(
-        &self,
-        endpoint_id: EndpointId,
-        hint: &str,
-        updated_ns: i64,
-    ) -> Result<(), StateError> {
-        self.connection.execute(
-            "INSERT INTO peer_hints (endpoint_id, hint, updated_ns)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(endpoint_id, hint) DO UPDATE SET updated_ns = excluded.updated_ns",
-            params![endpoint_id.as_bytes(), hint, updated_ns],
-        )?;
-        Ok(())
     }
 
     pub fn peer_hints(&self, endpoint_id: EndpointId) -> Result<Vec<(String, i64)>, StateError> {
@@ -629,6 +669,78 @@ impl StateStore {
             Ok((row.get(0)?, row.get(1)?))
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn replace_peer_hints(
+        &mut self,
+        endpoint_id: EndpointId,
+        hints: &[String],
+        updated_ns: i64,
+    ) -> Result<(), StateError> {
+        if hints.len() > MAX_PEER_HINTS
+            || hints
+                .iter()
+                .any(|hint| hint.is_empty() || hint.len() > MAX_PEER_HINT_BYTES)
+        {
+            return Err(StateError::PeerHintLimit);
+        }
+        let unique = hints.iter().collect::<std::collections::BTreeSet<_>>();
+        if unique.len() != hints.len() {
+            return Err(StateError::PeerHintLimit);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM peer_hints WHERE endpoint_id = ?1",
+            [endpoint_id.as_bytes()],
+        )?;
+        for hint in hints {
+            transaction.execute(
+                "INSERT INTO peer_hints (endpoint_id, hint, updated_ns) VALUES (?1, ?2, ?3)",
+                params![endpoint_id.as_bytes(), hint, updated_ns],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn record_peer_health(
+        &mut self,
+        endpoint_id: EndpointId,
+        reachable: bool,
+        observed_ns: i64,
+        event: &OperationalEvent,
+        max_logs: usize,
+    ) -> Result<(), StateError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO peer_health (endpoint_id, reachable, last_attempt_ns, last_success_ns)
+             VALUES (?1, ?2, ?3, CASE WHEN ?2 THEN ?3 ELSE NULL END)
+             ON CONFLICT(endpoint_id) DO UPDATE SET
+                reachable = excluded.reachable,
+                last_attempt_ns = excluded.last_attempt_ns,
+                last_success_ns = CASE WHEN excluded.reachable
+                    THEN excluded.last_attempt_ns ELSE peer_health.last_success_ns END",
+            params![endpoint_id.as_bytes(), reachable, observed_ns],
+        )?;
+        insert_log(&transaction, observed_ns, event, max_logs)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn peer_reachable(&self, endpoint_id: EndpointId) -> Result<bool, StateError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT reachable FROM peer_health WHERE endpoint_id = ?1",
+                [endpoint_id.as_bytes()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(false))
     }
 
     pub fn append_log(
@@ -908,6 +1020,117 @@ impl StateStore {
             )?;
             transaction.commit()?;
         }
+        if version < 5 {
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(
+                "ALTER TABLE operational_logs RENAME TO operational_logs_v4;
+                 CREATE TABLE operational_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_ns INTEGER NOT NULL,
+                    event_kind TEXT NOT NULL CHECK (
+                        event_kind IN (
+                            'state_opened', 'daemon_started', 'daemon_stopped',
+                            'collection_attached', 'collection_detached',
+                            'collection_paused', 'collection_scanned',
+                            'symlink_escape', 'symlink_cycle', 'path_rejected',
+                            'timestamp_rejected', 'record_accepted',
+                            'record_rejected', 'file_installed',
+                            'file_apply_rejected', 'repair_required',
+                            'peer_unreachable', 'peer_attempted',
+                            'peer_synchronized', 'peer_rejected',
+                            'file_sent', 'file_received', 'transfer_rejected'
+                        )
+                    ),
+                    collection TEXT CHECK (
+                        collection IS NULL OR length(collection) BETWEEN 1 AND 255
+                    ),
+                    path TEXT CHECK (path IS NULL OR length(path) BETWEEN 1 AND 4096),
+                    peer_endpoint BLOB CHECK (
+                        peer_endpoint IS NULL OR length(peer_endpoint) = 32
+                    ),
+                    candidate_modified_ns INTEGER,
+                    candidate_author BLOB CHECK (
+                        candidate_author IS NULL OR length(candidate_author) = 32
+                    ),
+                    winner_modified_ns INTEGER,
+                    winner_author BLOB CHECK (
+                        winner_author IS NULL OR length(winner_author) = 32
+                    )
+                 );
+                 INSERT INTO operational_logs
+                    (id, created_ns, event_kind, collection, path, peer_endpoint,
+                     candidate_modified_ns, candidate_author,
+                     winner_modified_ns, winner_author)
+                 SELECT id, created_ns, event_kind, collection, path, peer_endpoint,
+                        candidate_modified_ns, candidate_author,
+                        winner_modified_ns, winner_author
+                 FROM operational_logs_v4;
+                 DROP TABLE operational_logs_v4;
+                 CREATE TABLE peer_health (
+                    endpoint_id BLOB PRIMARY KEY NOT NULL CHECK (length(endpoint_id) = 32),
+                    reachable INTEGER NOT NULL CHECK (reachable IN (0, 1)),
+                    last_attempt_ns INTEGER NOT NULL,
+                    last_success_ns INTEGER
+                 );
+                 PRAGMA user_version = 5;",
+            )?;
+            transaction.commit()?;
+        }
+        if version < 6 {
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(
+                "ALTER TABLE operational_logs RENAME TO operational_logs_v5;
+                 CREATE TABLE operational_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_ns INTEGER NOT NULL,
+                    event_kind TEXT NOT NULL CHECK (
+                        event_kind IN (
+                            'state_opened', 'daemon_started', 'daemon_stopped',
+                            'collection_attached', 'collection_detached',
+                            'collection_paused', 'collection_scanned',
+                            'symlink_escape', 'symlink_cycle', 'path_rejected',
+                            'timestamp_rejected', 'record_accepted',
+                            'record_rejected', 'file_installed',
+                            'file_apply_rejected', 'repair_required',
+                            'peer_unreachable', 'peer_attempted',
+                            'peer_synchronized', 'peer_rejected',
+                            'peer_session_failed', 'file_sent', 'file_received',
+                            'transfer_rejected'
+                        )
+                    ),
+                    collection TEXT CHECK (
+                        collection IS NULL OR length(collection) BETWEEN 1 AND 255
+                    ),
+                    path TEXT CHECK (path IS NULL OR length(path) BETWEEN 1 AND 4096),
+                    peer_endpoint BLOB CHECK (
+                        peer_endpoint IS NULL OR length(peer_endpoint) = 32
+                    ),
+                    candidate_modified_ns INTEGER,
+                    candidate_author BLOB CHECK (
+                        candidate_author IS NULL OR length(candidate_author) = 32
+                    ),
+                    winner_modified_ns INTEGER,
+                    winner_author BLOB CHECK (
+                        winner_author IS NULL OR length(winner_author) = 32
+                    )
+                 );
+                 INSERT INTO operational_logs
+                    (id, created_ns, event_kind, collection, path, peer_endpoint,
+                     candidate_modified_ns, candidate_author,
+                     winner_modified_ns, winner_author)
+                 SELECT id, created_ns, event_kind, collection, path, peer_endpoint,
+                        candidate_modified_ns, candidate_author,
+                        winner_modified_ns, winner_author
+                 FROM operational_logs_v5;
+                 DROP TABLE operational_logs_v5;
+                 PRAGMA user_version = 6;",
+            )?;
+            transaction.commit()?;
+        }
         Ok(())
     }
 }
@@ -1093,6 +1316,33 @@ pub enum OperationalEvent {
     PeerUnreachable {
         peer_endpoint: EndpointId,
     },
+    PeerAttempted {
+        peer_endpoint: EndpointId,
+    },
+    PeerSynchronized {
+        peer_endpoint: EndpointId,
+    },
+    PeerRejected {
+        peer_endpoint: EndpointId,
+    },
+    PeerSessionFailed {
+        peer_endpoint: EndpointId,
+    },
+    FileSent {
+        collection: String,
+        path: ProtocolPath,
+        peer_endpoint: EndpointId,
+    },
+    FileReceived {
+        collection: String,
+        path: ProtocolPath,
+        peer_endpoint: EndpointId,
+    },
+    TransferRejected {
+        collection: String,
+        path: ProtocolPath,
+        peer_endpoint: EndpointId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1112,13 +1362,20 @@ impl OperationalEvent {
             | Self::CollectionAttached { .. }
             | Self::CollectionDetached { .. }
             | Self::RecordAccepted { .. }
-            | Self::FileInstalled { .. } => LogLevel::Info,
+            | Self::FileInstalled { .. }
+            | Self::PeerAttempted { .. }
+            | Self::PeerSynchronized { .. }
+            | Self::FileSent { .. }
+            | Self::FileReceived { .. } => LogLevel::Info,
             Self::CollectionPaused { .. }
             | Self::CollectionWarning { .. }
             | Self::RecordRejected { .. }
             | Self::FileApplyRejected { .. }
             | Self::RepairRequired { .. }
-            | Self::PeerUnreachable { .. } => LogLevel::Warn,
+            | Self::PeerUnreachable { .. }
+            | Self::PeerRejected { .. }
+            | Self::PeerSessionFailed { .. }
+            | Self::TransferRejected { .. } => LogLevel::Warn,
         }
     }
 }
@@ -1274,6 +1531,50 @@ fn decode_materialized_fingerprint(
             "materialized fingerprint is incomplete",
         )),
     }
+}
+
+type StoredPathRecordState = (
+    Vec<u8>,
+    Vec<u8>,
+    bool,
+    bool,
+    Option<i64>,
+    Option<i64>,
+    Option<Vec<u8>>,
+);
+
+fn stored_path_record_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredPathRecordState> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+    ))
+}
+
+fn decode_path_record_state(stored: StoredPathRecordState) -> Result<PathRecordState, StateError> {
+    let (
+        hash,
+        canonical,
+        materialized,
+        needs_repair,
+        materialized_modified_ns,
+        materialized_size,
+        materialized_hash,
+    ) = stored;
+    Ok(PathRecordState {
+        record: decode_stored_record((hash, canonical))?,
+        materialized,
+        needs_repair,
+        materialized_fingerprint: decode_materialized_fingerprint(
+            materialized_modified_ns,
+            materialized_size,
+            materialized_hash,
+        )?,
+    })
 }
 
 fn load_record(
@@ -1457,6 +1758,54 @@ fn insert_log(
             None,
             None,
         ),
+        OperationalEvent::PeerAttempted { peer_endpoint }
+        | OperationalEvent::PeerSynchronized { peer_endpoint }
+        | OperationalEvent::PeerRejected { peer_endpoint }
+        | OperationalEvent::PeerSessionFailed { peer_endpoint } => (
+            match event {
+                OperationalEvent::PeerAttempted { .. } => "peer_attempted",
+                OperationalEvent::PeerSynchronized { .. } => "peer_synchronized",
+                OperationalEvent::PeerRejected { .. } => "peer_rejected",
+                OperationalEvent::PeerSessionFailed { .. } => "peer_session_failed",
+                _ => unreachable!(),
+            },
+            None,
+            None,
+            Some(*peer_endpoint.as_bytes()),
+            None,
+            None,
+            None,
+            None,
+        ),
+        OperationalEvent::FileSent {
+            collection,
+            path,
+            peer_endpoint,
+        }
+        | OperationalEvent::FileReceived {
+            collection,
+            path,
+            peer_endpoint,
+        }
+        | OperationalEvent::TransferRejected {
+            collection,
+            path,
+            peer_endpoint,
+        } => (
+            match event {
+                OperationalEvent::FileSent { .. } => "file_sent",
+                OperationalEvent::FileReceived { .. } => "file_received",
+                OperationalEvent::TransferRejected { .. } => "transfer_rejected",
+                _ => unreachable!(),
+            },
+            Some(collection.as_str()),
+            Some(path.as_str()),
+            Some(*peer_endpoint.as_bytes()),
+            None,
+            None,
+            None,
+            None,
+        ),
     };
     transaction.execute(
         "INSERT INTO operational_logs
@@ -1573,6 +1922,39 @@ fn decode_operational_event(
         "peer_unreachable" => Ok(OperationalEvent::PeerUnreachable {
             peer_endpoint: required(peer_endpoint, "unreachable peer EndpointID is missing")?,
         }),
+        "peer_attempted" | "peer_synchronized" | "peer_rejected" | "peer_session_failed" => {
+            let peer_endpoint = required(peer_endpoint, "peer event EndpointID is missing")?;
+            Ok(match stored.event_kind.as_str() {
+                "peer_attempted" => OperationalEvent::PeerAttempted { peer_endpoint },
+                "peer_synchronized" => OperationalEvent::PeerSynchronized { peer_endpoint },
+                "peer_rejected" => OperationalEvent::PeerRejected { peer_endpoint },
+                "peer_session_failed" => OperationalEvent::PeerSessionFailed { peer_endpoint },
+                _ => unreachable!(),
+            })
+        }
+        "file_sent" | "file_received" | "transfer_rejected" => {
+            let collection = required(stored.collection, "transfer collection is missing")?;
+            let path = ProtocolPath::parse(&required(stored.path, "transfer path is missing")?)?;
+            let peer_endpoint = required(peer_endpoint, "transfer peer EndpointID is missing")?;
+            Ok(match stored.event_kind.as_str() {
+                "file_sent" => OperationalEvent::FileSent {
+                    collection,
+                    path,
+                    peer_endpoint,
+                },
+                "file_received" => OperationalEvent::FileReceived {
+                    collection,
+                    path,
+                    peer_endpoint,
+                },
+                "transfer_rejected" => OperationalEvent::TransferRejected {
+                    collection,
+                    path,
+                    peer_endpoint,
+                },
+                _ => unreachable!(),
+            })
+        }
         _ => Err(StateError::InvalidStoredState(
             "operational event kind is unknown",
         )),
@@ -1608,6 +1990,8 @@ pub enum StateError {
     RosterTopology(&'static str),
     #[error("numeric state cannot be represented in SQLite")]
     NumberOverflow,
+    #[error("peer address hints exceed their count or size limit")]
+    PeerHintLimit,
     #[error(transparent)]
     Record(#[from] RecordError),
     #[error(transparent)]
@@ -1667,6 +2051,34 @@ mod tests {
             )
             .unwrap();
         assert_eq!(table_count, 1);
+    }
+
+    #[test]
+    fn version_five_logs_upgrade_and_accept_typed_session_failures() {
+        let temporary = tempfile::tempdir().unwrap();
+        let database = temporary.path().join("state.sqlite3");
+        {
+            let mut store = StateStore::open(&database).unwrap();
+            store
+                .append_log(1, &OperationalEvent::StateOpened, 10)
+                .unwrap();
+            store
+                .connection
+                .pragma_update(None, "user_version", 5)
+                .unwrap();
+        }
+
+        let mut store = StateStore::open(&database).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            store.logs().unwrap()[0].event,
+            OperationalEvent::StateOpened
+        );
+        let event = OperationalEvent::PeerSessionFailed {
+            peer_endpoint: EndpointId::from_bytes([7; 32]),
+        };
+        store.append_log(2, &event, 10).unwrap();
+        assert_eq!(store.logs().unwrap()[1].event, event);
     }
 
     #[test]
@@ -1897,7 +2309,7 @@ mod tests {
                 .merge_record(&record, 10, Some(EndpointId::from_bytes([4; 32])), 100)
                 .unwrap();
             store
-                .upsert_peer_hint(creator.endpoint_id(), "127.0.0.1:7000", 10)
+                .replace_peer_hints(creator.endpoint_id(), &["127.0.0.1:7000".to_owned()], 10)
                 .unwrap();
         }
 
@@ -2015,6 +2427,39 @@ mod tests {
         let states = store.record_states(".agents").unwrap();
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].materialized_fingerprint, Some(second));
+    }
+
+    #[test]
+    fn indexed_record_state_lookup_handles_present_absent_and_corrupt_rows() {
+        let mut store = StateStore::open_in_memory().unwrap();
+        store
+            .add_collection(".agents", Path::new("/skills"), None)
+            .unwrap();
+        let record = sample_record(10, 7);
+        store.merge_record(&record, 10, None, 100).unwrap();
+        assert_eq!(
+            store.record_state(".agents", "review/SKILL.md").unwrap(),
+            Some(store.record_states(".agents").unwrap().remove(0))
+        );
+        assert_eq!(
+            store.record_state(".agents", "missing/SKILL.md").unwrap(),
+            None
+        );
+
+        store
+            .connection
+            .execute(
+                "UPDATE path_records SET materialized_hash = ?3
+                 WHERE collection = ?1 AND path = ?2",
+                params![".agents", "review/SKILL.md", vec![1_u8]],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.record_state(".agents", "review/SKILL.md"),
+            Err(StateError::InvalidStoredState(
+                "materialized file hash has the wrong length"
+            ))
+        ));
     }
 
     #[test]
@@ -2161,7 +2606,7 @@ mod tests {
         store
             .append_log(
                 1,
-                &OperationalEvent::PeerUnreachable {
+                &OperationalEvent::PeerSessionFailed {
                     peer_endpoint: EndpointId::from_bytes([7; 32]),
                 },
                 10,
@@ -2189,5 +2634,23 @@ mod tests {
             )
             .unwrap();
         assert!(!stored_text.contains(config.joining.headers["Authorization"].expose()));
+    }
+
+    #[test]
+    fn peer_hints_are_atomically_replaced_and_bounded() {
+        let mut store = StateStore::open_in_memory().unwrap();
+        let peer = EndpointId::from_bytes([8; 32]);
+        store
+            .replace_peer_hints(peer, &["first".to_owned(), "second".to_owned()], 1)
+            .unwrap();
+        store
+            .replace_peer_hints(peer, &["new".to_owned()], 2)
+            .unwrap();
+        assert_eq!(store.peer_hints(peer).unwrap(), vec![("new".to_owned(), 2)]);
+        let too_many = (0..=MAX_PEER_HINTS)
+            .map(|index| format!("hint-{index}"))
+            .collect::<Vec<_>>();
+        assert!(store.replace_peer_hints(peer, &too_many, 3).is_err());
+        assert_eq!(store.peer_hints(peer).unwrap(), vec![("new".to_owned(), 2)]);
     }
 }
