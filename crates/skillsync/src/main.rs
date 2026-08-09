@@ -184,24 +184,11 @@ fn command_invite(
     io::stdout().flush().map_err(CliError::from_error)?;
 
     let deadline = std::time::Instant::now() + config.joining.invitation_ttl;
-    let pending = loop {
-        if std::time::Instant::now() >= deadline {
-            return Err(CliError::new(
-                "invitation_expired",
-                "the invitation expired",
-            ));
-        }
-        let response =
-            send_request(paths, &ControlRequest::PendingJoin).map_err(CliError::from_error)?;
-        if !response.ok {
-            return Err(response_error(response));
-        }
-        let result = response.result.expect("successful response");
-        if !result["pending"].is_null() {
-            break result["pending"].clone();
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    };
+    let pending = wait_for_pending_join(
+        deadline,
+        || send_request(paths, &ControlRequest::PendingJoin),
+        std::thread::sleep,
+    )?;
     let request_id = pending["request_id"]
         .as_str()
         .ok_or_else(|| CliError::new("invalid_daemon_response", "join request is invalid"))?;
@@ -242,6 +229,52 @@ fn command_invite(
         println!("Device rejected.");
     }
     Ok(())
+}
+
+fn wait_for_pending_join(
+    deadline: std::time::Instant,
+    mut request: impl FnMut() -> Result<ControlResponse, DaemonError>,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> Result<Value, CliError> {
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(CliError::new(
+                "invitation_expired",
+                "the invitation expired",
+            ));
+        }
+        let response = match request() {
+            Ok(response) => response,
+            Err(error) if retryable_pending_join_error(&error) => {
+                sleep(std::time::Duration::from_millis(200));
+                continue;
+            }
+            Err(error) => return Err(CliError::from_error(error)),
+        };
+        if !response.ok {
+            return Err(response_error(response));
+        }
+        let result = response.result.ok_or_else(|| {
+            CliError::new("invalid_daemon_response", "daemon response has no result")
+        })?;
+        if !result["pending"].is_null() {
+            return Ok(result["pending"].clone());
+        }
+        sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+fn retryable_pending_join_error(error: &DaemonError) -> bool {
+    matches!(
+        error,
+        DaemonError::Io(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::Interrupted
+            )
+    )
 }
 
 fn join_request_human(device_name: &str, endpoint_id: &str) -> String {
@@ -898,5 +931,51 @@ mod tests {
             assert!(!output.contains("line\nbreak"));
             assert!(output.contains("\\u{"));
         }
+    }
+
+    #[test]
+    fn pending_join_poll_retries_only_transient_control_io() {
+        let mut requests = 0;
+        let mut sleeps = 0;
+        let pending = wait_for_pending_join(
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            || {
+                requests += 1;
+                match requests {
+                    1 => Err(DaemonError::Io(io::ErrorKind::WouldBlock.into())),
+                    2 => Err(DaemonError::Io(io::ErrorKind::TimedOut.into())),
+                    3 => Err(DaemonError::Io(io::ErrorKind::Interrupted.into())),
+                    4 => Ok(ControlResponse {
+                        ok: true,
+                        result: Some(json!({ "pending": null })),
+                        error: None,
+                    }),
+                    _ => Ok(ControlResponse {
+                        ok: true,
+                        result: Some(json!({
+                            "pending": {
+                                "request_id": "request",
+                                "endpoint_id": "endpoint",
+                                "device_name": "device"
+                            }
+                        })),
+                        error: None,
+                    }),
+                }
+            },
+            |_| sleeps += 1,
+        )
+        .unwrap_or_else(|_| panic!("transient pending-join errors should be retried"));
+        assert_eq!(pending["request_id"], "request");
+        assert_eq!(requests, 5);
+        assert_eq!(sleeps, 4);
+
+        let fatal = wait_for_pending_join(
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            || Err(DaemonError::Io(io::ErrorKind::NotFound.into())),
+            |_| panic!("a non-transient daemon error must not be retried"),
+        )
+        .unwrap_err();
+        assert!(fatal.message.contains("daemon I/O failed"));
     }
 }
