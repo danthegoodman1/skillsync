@@ -237,10 +237,7 @@ pub fn run(paths: PlatformPaths, config: Config) -> Result<(), DaemonError> {
                             endpoint_id,
                             &network,
                         ),
-                        Err(error) => (
-                            ControlResponse::failure("invalid_request", error.to_string()),
-                            DaemonAction::None,
-                        ),
+                        Err(error) => (control_request_failure(&error), DaemonAction::None),
                     };
                     let _ = write_response(stream, &response);
                     match action {
@@ -287,9 +284,33 @@ pub fn run(paths: PlatformPaths, config: Config) -> Result<(), DaemonError> {
 }
 
 fn read_request(stream: &UnixStream) -> Result<ControlRequest, DaemonError> {
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    read_request_with_timeout(stream, Duration::from_secs(5))
+}
+
+fn read_request_with_timeout(
+    stream: &UnixStream,
+    timeout: Duration,
+) -> Result<ControlRequest, DaemonError> {
+    stream.set_read_timeout(Some(timeout))?;
     let frame = read_frame(&mut BufReader::new(stream), REQUEST_LIMIT)?;
     Ok(serde_json::from_slice(&frame)?)
+}
+
+fn control_request_failure(error: &DaemonError) -> ControlResponse {
+    if matches!(
+        error,
+        DaemonError::Io(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::Interrupted
+            )
+    ) {
+        ControlResponse::failure("request_timeout", "daemon control request timed out")
+    } else {
+        ControlResponse::failure("invalid_request", error.to_string())
+    }
 }
 
 fn write_response(mut stream: UnixStream, response: &ControlResponse) -> Result<(), DaemonError> {
@@ -1018,6 +1039,28 @@ mod tests {
             read_frame(&mut Cursor::new(oversized), 8),
             Err(DaemonError::FrameTooLarge)
         ));
+    }
+
+    #[test]
+    fn unix_socket_read_timeout_maps_to_a_typed_retryable_response() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let error = read_request_with_timeout(&server, Duration::from_millis(10)).unwrap_err();
+        assert!(matches!(
+            &error,
+            DaemonError::Io(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) && error.raw_os_error().is_some()
+        ));
+        let response = control_request_failure(&error);
+        write_response(server, &response).unwrap();
+        let encoded = read_frame(&mut BufReader::new(client), RESPONSE_LIMIT).unwrap();
+        let response: ControlResponse = serde_json::from_slice(&encoded).unwrap();
+        assert!(!response.ok);
+        let error = response.error.unwrap();
+        assert_eq!(error.code, "request_timeout");
+        assert_eq!(error.message, "daemon control request timed out");
     }
 
     #[test]

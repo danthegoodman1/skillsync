@@ -244,6 +244,10 @@ fn wait_for_pending_join(
             ));
         }
         let response = match request() {
+            Ok(response) if retryable_pending_join_response(&response) => {
+                sleep(std::time::Duration::from_millis(200));
+                continue;
+            }
             Ok(response) => response,
             Err(error) if retryable_pending_join_error(&error) => {
                 sleep(std::time::Duration::from_millis(200));
@@ -262,6 +266,14 @@ fn wait_for_pending_join(
         }
         sleep(std::time::Duration::from_millis(200));
     }
+}
+
+fn retryable_pending_join_response(response: &ControlResponse) -> bool {
+    !response.ok
+        && response
+            .error
+            .as_ref()
+            .is_some_and(|error| error.code == "request_timeout")
 }
 
 fn retryable_pending_join_error(error: &DaemonError) -> bool {
@@ -946,6 +958,14 @@ mod tests {
                     2 => Err(DaemonError::Io(io::ErrorKind::TimedOut.into())),
                     3 => Err(DaemonError::Io(io::ErrorKind::Interrupted.into())),
                     4 => Ok(ControlResponse {
+                        ok: false,
+                        result: None,
+                        error: Some(skillsync::daemon::ControlError {
+                            code: "request_timeout".to_owned(),
+                            message: "daemon control request timed out".to_owned(),
+                        }),
+                    }),
+                    5 => Ok(ControlResponse {
                         ok: true,
                         result: Some(json!({ "pending": null })),
                         error: None,
@@ -967,8 +987,8 @@ mod tests {
         )
         .unwrap_or_else(|_| panic!("transient pending-join errors should be retried"));
         assert_eq!(pending["request_id"], "request");
-        assert_eq!(requests, 5);
-        assert_eq!(sleeps, 4);
+        assert_eq!(requests, 6);
+        assert_eq!(sleeps, 5);
 
         let fatal = wait_for_pending_join(
             std::time::Instant::now() + std::time::Duration::from_secs(1),
