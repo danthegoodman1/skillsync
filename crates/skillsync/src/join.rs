@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::future::Future;
 use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -347,7 +348,20 @@ async fn run_joiner_on_endpoint(
     )?;
     write_json(&mut send, &JoinAck { accepted: true }, JOIN_REQUEST_LIMIT).await?;
     send.finish().map_err(|_| JoinError::Transport)?;
+    wait_for_ack_delivery(send.stopped()).await?;
     Ok(inviter)
+}
+
+async fn wait_for_ack_delivery<F, S, E>(stopped: F) -> Result<(), JoinError>
+where
+    F: Future<Output = Result<Option<S>, E>>,
+{
+    match tokio::time::timeout(JOIN_IO_TIMEOUT, stopped).await {
+        Ok(Ok(None)) => {}
+        Ok(Ok(Some(_))) | Ok(Err(_)) => return Err(JoinError::Transport),
+        Err(_) => return Err(JoinError::Timeout),
+    }
+    Ok(())
 }
 
 pub async fn run_inviter(
@@ -954,6 +968,34 @@ mod tests {
         assert_eq!(state.peer_hints(authenticated_inviter).unwrap().len(), 1);
         joiner_endpoint.close().await;
         inviter_endpoint.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ack_delivery_wait_is_bounded_and_requires_transport_confirmation() {
+        let (confirm, confirmation) = oneshot::channel::<Result<Option<()>, ()>>();
+        let waiting = tokio::spawn(wait_for_ack_delivery(
+            async move { confirmation.await.unwrap() },
+        ));
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        confirm.send(Ok(None)).unwrap();
+        waiting.await.unwrap().unwrap();
+
+        assert!(matches!(
+            wait_for_ack_delivery(async { Ok::<_, ()>(Some(())) }).await,
+            Err(JoinError::Transport)
+        ));
+        assert!(matches!(
+            wait_for_ack_delivery(async { Err::<Option<()>, _>(()) }).await,
+            Err(JoinError::Transport)
+        ));
+
+        let timed_out = tokio::spawn(wait_for_ack_delivery(std::future::pending::<
+            Result<Option<()>, ()>,
+        >()));
+        tokio::task::yield_now().await;
+        tokio::time::advance(JOIN_IO_TIMEOUT + Duration::from_secs(1)).await;
+        assert!(matches!(timed_out.await.unwrap(), Err(JoinError::Timeout)));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
