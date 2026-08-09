@@ -27,6 +27,7 @@ struct DeviceFixture {
 struct JoiningFixture {
     url: String,
     ticket: Arc<Mutex<Option<String>>>,
+    stages: Arc<Mutex<Vec<&'static str>>>,
     thread: thread::JoinHandle<()>,
 }
 
@@ -81,10 +82,17 @@ impl JoiningFixture {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let ticket = Arc::new(Mutex::new(None));
         let shared_ticket = ticket.clone();
+        let stages = Arc::new(Mutex::new(Vec::new()));
+        let shared_stages = stages.clone();
         let thread = thread::spawn(move || {
             for request_number in 0..2 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let request = read_http_request(&mut stream);
+                shared_stages.lock().unwrap().push(if request_number == 0 {
+                    "create_received"
+                } else {
+                    "claim_received"
+                });
                 let header_end = request
                     .windows(4)
                     .position(|bytes| bytes == b"\r\n\r\n")
@@ -122,11 +130,17 @@ impl JoiningFixture {
                 )
                 .unwrap();
                 stream.write_all(&response).unwrap();
+                shared_stages.lock().unwrap().push(if request_number == 0 {
+                    "create_sent"
+                } else {
+                    "claim_sent"
+                });
             }
         });
         Self {
             url,
             ticket,
+            stages,
             thread,
         }
     }
@@ -144,6 +158,10 @@ impl JoiningFixture {
 
     fn finish(self) {
         self.thread.join().unwrap();
+    }
+
+    fn stages(&self) -> String {
+        self.stages.lock().unwrap().join(",")
     }
 }
 
@@ -407,6 +425,60 @@ fn wait_output(mut child: Child, timeout: Duration) -> std::process::Output {
     );
 }
 
+fn wait_for_output_marker(path: &Path, child: &mut Child, marker: &[u8], timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let output = fs::read(path).unwrap_or_default();
+        if output.windows(marker.len()).any(|window| window == marker) {
+            return;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!(
+                "command exited before readiness marker with {status}: stdout={}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!(
+        "command did not emit its readiness marker: stdout={}",
+        String::from_utf8_lossy(&fs::read(path).unwrap_or_default())
+    );
+}
+
+fn wait_outputs_together(
+    mut first: Child,
+    mut second: Child,
+    timeout: Duration,
+) -> (std::process::Output, std::process::Output, bool) {
+    let deadline = Instant::now() + timeout;
+    let mut timed_out = false;
+    loop {
+        let first_status = first.try_wait().unwrap();
+        let second_status = second.try_wait().unwrap();
+        if first_status.is_some() && second_status.is_some() {
+            break;
+        }
+        if first_status.is_some_and(|status| !status.success())
+            || second_status.is_some_and(|status| !status.success())
+        {
+            let _ = first.kill();
+            let _ = second.kill();
+            break;
+        }
+        if Instant::now() >= deadline {
+            timed_out = true;
+            let _ = first.kill();
+            let _ = second.kill();
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let first_output = first.wait_with_output().unwrap();
+    let second_output = second.wait_with_output().unwrap();
+    (first_output, second_output, timed_out)
+}
+
 #[test]
 fn two_daemons_sync_create_edit_delete_and_restart_without_external_services() {
     let temp = TempDir::new().unwrap();
@@ -536,15 +608,23 @@ fn third_device_joins_one_member_learns_every_peer_syncs_and_is_refused_after_re
     );
 
     let mut invite = first.command();
+    let invite_stdout_path = temp.path().join("invite.stdout");
     invite
         .arg("invite")
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::from(fs::File::create(&invite_stdout_path).unwrap()))
         .stderr(Stdio::piped());
     let mut invite = invite.spawn().unwrap();
     invite.stdin.as_mut().unwrap().write_all(b"y\n").unwrap();
     invite.stdin.take();
     joining.wait_created();
+    // The service receives creation before the daemon activates the invitation.
+    wait_for_output_marker(
+        &invite_stdout_path,
+        &mut invite,
+        b"Waiting for another device",
+        Duration::from_secs(15),
+    );
 
     let third_identity = IdentityStore::new(&third.paths).load_or_create().unwrap().0;
     let third_endpoint = third_identity.endpoint_id();
@@ -557,9 +637,18 @@ fn third_device_joins_one_member_learns_every_peer_syncs_and_is_refused_after_re
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let join = join.spawn().unwrap();
-    let invite_output = wait_output(invite, Duration::from_secs(60));
-    let join_output = wait_output(join, Duration::from_secs(60));
-    joining.finish();
+    let (mut invite_output, join_output, commands_timed_out) =
+        wait_outputs_together(invite, join, Duration::from_secs(60));
+    invite_output.stdout = fs::read(&invite_stdout_path).unwrap();
+    assert!(
+        !commands_timed_out,
+        "commands timed out: stages={} invite stdout={} stderr={} join stdout={} stderr={}",
+        joining.stages(),
+        String::from_utf8_lossy(&invite_output.stdout),
+        String::from_utf8_lossy(&invite_output.stderr),
+        String::from_utf8_lossy(&join_output.stdout),
+        String::from_utf8_lossy(&join_output.stderr)
+    );
     assert!(
         invite_output.status.success() && join_output.status.success(),
         "invite stdout={} stderr={} join stdout={} stderr={}",
@@ -568,6 +657,7 @@ fn third_device_joins_one_member_learns_every_peer_syncs_and_is_refused_after_re
         String::from_utf8_lossy(&join_output.stdout),
         String::from_utf8_lossy(&join_output.stderr)
     );
+    joining.finish();
     let invite_stdout = String::from_utf8(invite_output.stdout).unwrap();
     let join_stdout = String::from_utf8(join_output.stdout).unwrap();
     assert!(invite_stdout.contains(&third_endpoint.to_string()));
