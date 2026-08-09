@@ -14,7 +14,6 @@ use crate::record::{Record, RecordError};
 use crate::roster::{RosterChange, RosterError, RosterHash, RosterRevision, select_chain};
 
 const SCHEMA_VERSION: i64 = 1;
-const MAX_PEER_HINTS: usize = 32;
 const MAX_PEER_HINT_BYTES: usize = 16 * 1024;
 const MAX_ROSTER_RETRY_DEPTH: usize = 1_024;
 const MAX_OPERATIONAL_EVENT_BYTES: usize = 16 * 1024;
@@ -46,7 +45,7 @@ const SCHEMA_TABLES: [(&str, &[&str]); 6] = [
         ],
     ),
     ("peer_health", &["endpoint_id", "reachable"]),
-    ("peer_hints", &["endpoint_id", "hint", "updated_ns"]),
+    ("peer_hints", &["endpoint_id", "hint"]),
     ("roster_revisions", &["hash", "canonical"]),
 ];
 
@@ -381,23 +380,22 @@ impl StateStore {
         self.apply_roster_change_inner(identity, change, None)
     }
 
-    pub fn apply_roster_change_with_peer_hints(
+    pub fn apply_roster_change_with_peer_hint(
         &mut self,
         identity: &DeviceIdentity,
         change: RosterChange,
         hint_endpoint: EndpointId,
-        hints: &[String],
-        updated_ns: i64,
+        hint: &str,
     ) -> Result<RosterRevision, StateError> {
-        validate_peer_hints(hints)?;
-        self.apply_roster_change_inner(identity, change, Some((hint_endpoint, hints, updated_ns)))
+        validate_peer_hint(hint)?;
+        self.apply_roster_change_inner(identity, change, Some((hint_endpoint, hint)))
     }
 
     fn apply_roster_change_inner(
         &mut self,
         identity: &DeviceIdentity,
         change: RosterChange,
-        peer_hints: Option<(EndpointId, &[String], i64)>,
+        peer_hint: Option<(EndpointId, &str)>,
     ) -> Result<RosterRevision, StateError> {
         for _ in 0..=MAX_ROSTER_RETRY_DEPTH {
             let chain = self.selected_roster_chain()?;
@@ -405,11 +403,11 @@ impl StateStore {
                 .last()
                 .ok_or(StateError::RosterTopology("roster genesis is missing"))?;
             if roster_change_is_satisfied(parent, &change) {
-                if let Some((endpoint, hints, updated_ns)) = peer_hints {
+                if let Some((endpoint, hint)) = peer_hint {
                     let transaction = self
                         .connection
                         .transaction_with_behavior(TransactionBehavior::Immediate)?;
-                    replace_peer_hints_in(&transaction, endpoint, hints, updated_ns)?;
+                    replace_peer_hint_in(&transaction, endpoint, hint)?;
                     transaction.commit()?;
                 }
                 return Ok(parent.clone());
@@ -421,8 +419,8 @@ impl StateStore {
             if load_roster_revision(&transaction, revision.canonical_hash())?.is_none() {
                 insert_roster_revision_row(&transaction, &revision)?;
             }
-            if let Some((endpoint, hints, updated_ns)) = peer_hints {
-                replace_peer_hints_in(&transaction, endpoint, hints, updated_ns)?;
+            if let Some((endpoint, hint)) = peer_hint {
+                replace_peer_hint_in(&transaction, endpoint, hint)?;
             }
             transaction.commit()?;
             let selected = self.selected_roster_chain()?;
@@ -448,7 +446,7 @@ impl StateStore {
         &mut self,
         revisions: &[RosterRevision],
         local_endpoint: EndpointId,
-        peer_hints: &[(EndpointId, Vec<String>)],
+        peer_hints: &[(EndpointId, String)],
     ) -> Result<(), StateError> {
         self.install_joined_state_inner(revisions, local_endpoint, None, peer_hints, false)
     }
@@ -458,7 +456,7 @@ impl StateStore {
         revisions: &[RosterRevision],
         local_endpoint: EndpointId,
         local_name: &str,
-        peer_hints: &[(EndpointId, Vec<String>)],
+        peer_hints: &[(EndpointId, String)],
     ) -> Result<(), StateError> {
         self.install_joined_state_inner(
             revisions,
@@ -474,7 +472,7 @@ impl StateStore {
         revisions: &[RosterRevision],
         local_endpoint: EndpointId,
         local_name: Option<&str>,
-        peer_hints: &[(EndpointId, Vec<String>)],
+        peer_hints: &[(EndpointId, String)],
         allow_resume: bool,
     ) -> Result<(), StateError> {
         let Some(genesis) = revisions.first() else {
@@ -523,8 +521,8 @@ impl StateStore {
                 "local membership cannot resume this join",
             ));
         }
-        for (_, hints) in peer_hints {
-            validate_peer_hints(hints)?;
+        for (_, hint) in peer_hints {
+            validate_peer_hint(hint)?;
         }
         let transaction = self
             .connection
@@ -534,8 +532,8 @@ impl StateStore {
                 insert_roster_revision_row(&transaction, revision)?;
             }
         }
-        for (endpoint, hints) in peer_hints {
-            replace_peer_hints_in(&transaction, *endpoint, hints, crate::setup::now_ns())?;
+        for (endpoint, hint) in peer_hints {
+            replace_peer_hint_in(&transaction, *endpoint, hint)?;
         }
         transaction.commit()?;
         if allow_resume
@@ -825,28 +823,31 @@ impl StateStore {
         ))
     }
 
-    pub fn peer_hints(&self, endpoint_id: EndpointId) -> Result<Vec<(String, i64)>, StateError> {
-        let mut statement = self.connection.prepare(
-            "SELECT hint, updated_ns FROM peer_hints
-             WHERE endpoint_id = ?1 ORDER BY hint",
-        )?;
-        let rows = statement.query_map([endpoint_id.as_bytes()], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    pub fn peer_hint(&self, endpoint_id: EndpointId) -> Result<Option<String>, StateError> {
+        self.connection
+            .query_row(
+                "SELECT (
+                    SELECT hint FROM peer_hints
+                    WHERE endpoint_id = ?1
+                      AND typeof(hint) = 'text'
+                      AND length(CAST(hint AS BLOB)) BETWEEN 1 AND 16384
+                 )",
+                [endpoint_id.as_bytes()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(Into::into)
     }
 
-    pub fn replace_peer_hints(
+    pub fn replace_peer_hint(
         &mut self,
         endpoint_id: EndpointId,
-        hints: &[String],
-        updated_ns: i64,
+        hint: &str,
     ) -> Result<(), StateError> {
-        validate_peer_hints(hints)?;
+        validate_peer_hint(hint)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        replace_peer_hints_in(&transaction, endpoint_id, hints, updated_ns)?;
+        replace_peer_hint_in(&transaction, endpoint_id, hint)?;
         transaction.commit()?;
         Ok(())
     }
@@ -999,10 +1000,11 @@ impl StateStore {
                     )
                 );
                 CREATE TABLE peer_hints (
-                    endpoint_id BLOB NOT NULL CHECK (length(endpoint_id) = 32),
-                    hint TEXT NOT NULL CHECK (hint <> ''),
-                    updated_ns INTEGER NOT NULL,
-                    PRIMARY KEY (endpoint_id, hint)
+                    endpoint_id BLOB PRIMARY KEY NOT NULL CHECK (length(endpoint_id) = 32),
+                    hint TEXT NOT NULL CHECK (
+                        typeof(hint) = 'text' AND
+                        length(CAST(hint AS BLOB)) BETWEEN 1 AND 16384
+                    )
                 );
                 CREATE TABLE operational_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1362,38 +1364,23 @@ fn roster_change_is_satisfied(revision: &RosterRevision, change: &RosterChange) 
     }
 }
 
-fn validate_peer_hints(hints: &[String]) -> Result<(), StateError> {
-    if hints.len() > MAX_PEER_HINTS
-        || hints
-            .iter()
-            .any(|hint| hint.is_empty() || hint.len() > MAX_PEER_HINT_BYTES)
-        || hints
-            .iter()
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
-            != hints.len()
-    {
+fn validate_peer_hint(hint: &str) -> Result<(), StateError> {
+    if hint.is_empty() || hint.len() > MAX_PEER_HINT_BYTES {
         return Err(StateError::PeerHintLimit);
     }
     Ok(())
 }
 
-fn replace_peer_hints_in(
+fn replace_peer_hint_in(
     connection: &Connection,
     endpoint_id: EndpointId,
-    hints: &[String],
-    updated_ns: i64,
+    hint: &str,
 ) -> Result<(), StateError> {
     connection.execute(
-        "DELETE FROM peer_hints WHERE endpoint_id = ?1",
-        [endpoint_id.as_bytes()],
+        "INSERT INTO peer_hints (endpoint_id, hint) VALUES (?1, ?2)
+         ON CONFLICT(endpoint_id) DO UPDATE SET hint = excluded.hint",
+        params![endpoint_id.as_bytes(), hint],
     )?;
-    for hint in hints {
-        connection.execute(
-            "INSERT INTO peer_hints (endpoint_id, hint, updated_ns) VALUES (?1, ?2, ?3)",
-            params![endpoint_id.as_bytes(), hint, updated_ns],
-        )?;
-    }
     Ok(())
 }
 
@@ -2128,7 +2115,7 @@ mod tests {
                 .merge_record(&record, 10, Some(EndpointId::from_bytes([4; 32])), 100)
                 .unwrap();
             store
-                .replace_peer_hints(creator.endpoint_id(), &["127.0.0.1:7000".to_owned()], 10)
+                .replace_peer_hint(creator.endpoint_id(), "127.0.0.1:7000")
                 .unwrap();
         }
 
@@ -2152,8 +2139,8 @@ mod tests {
             Some(record)
         );
         assert_eq!(
-            reopened.peer_hints(creator.endpoint_id()).unwrap(),
-            vec![("127.0.0.1:7000".to_owned(), 10)]
+            reopened.peer_hint(creator.endpoint_id()).unwrap(),
+            Some("127.0.0.1:7000".to_owned())
         );
         assert_eq!(reopened.logs().unwrap().len(), 1);
         assert_eq!(
@@ -2539,21 +2526,76 @@ mod tests {
     }
 
     #[test]
-    fn peer_hints_are_atomically_replaced_and_bounded() {
+    fn peer_hint_is_atomically_replaced_and_bounded() {
         let mut store = StateStore::open_in_memory().unwrap();
         let peer = EndpointId::from_bytes([8; 32]);
-        store
-            .replace_peer_hints(peer, &["first".to_owned(), "second".to_owned()], 1)
+        store.replace_peer_hint(peer, "first").unwrap();
+        store.replace_peer_hint(peer, "new").unwrap();
+        assert_eq!(store.peer_hint(peer).unwrap(), Some("new".to_owned()));
+        let too_large = "x".repeat(MAX_PEER_HINT_BYTES + 1);
+        assert!(store.replace_peer_hint(peer, &too_large).is_err());
+        assert_eq!(store.peer_hint(peer).unwrap(), Some("new".to_owned()));
+    }
+
+    #[test]
+    fn peer_hint_read_guard_never_returns_invalid_sqlite_cells() {
+        let temporary = tempfile::tempdir().unwrap();
+        let database = temporary.path().join("state.sqlite3");
+        let peer = EndpointId::from_bytes([18; 32]);
+        StateStore::open(&database)
+            .unwrap()
+            .replace_peer_hint(peer, "valid")
             .unwrap();
+        let store = StateStore::open(&database).unwrap();
+        assert_eq!(store.peer_hint(peer).unwrap(), Some("valid".to_owned()));
         store
-            .replace_peer_hints(peer, &["new".to_owned()], 2)
+            .connection
+            .pragma_update(None, "ignore_check_constraints", true)
             .unwrap();
-        assert_eq!(store.peer_hints(peer).unwrap(), vec![("new".to_owned(), 2)]);
-        let too_many = (0..=MAX_PEER_HINTS)
-            .map(|index| format!("hint-{index}"))
-            .collect::<Vec<_>>();
-        assert!(store.replace_peer_hints(peer, &too_many, 3).is_err());
-        assert_eq!(store.peer_hints(peer).unwrap(), vec![("new".to_owned(), 2)]);
+
+        store
+            .connection
+            .execute(
+                "UPDATE peer_hints SET hint = '' WHERE endpoint_id = ?1",
+                [peer.as_bytes()],
+            )
+            .unwrap();
+        assert_eq!(store.peer_hint(peer).unwrap(), None);
+        store
+            .connection
+            .execute(
+                "UPDATE peer_hints SET hint = CAST(zeroblob(32) AS BLOB)
+                 WHERE endpoint_id = ?1",
+                [peer.as_bytes()],
+            )
+            .unwrap();
+        assert_eq!(store.peer_hint(peer).unwrap(), None);
+        store
+            .connection
+            .execute(
+                "UPDATE peer_hints SET hint = printf('%*s', 16385, '')
+                 WHERE endpoint_id = ?1",
+                [peer.as_bytes()],
+            )
+            .unwrap();
+        assert_eq!(store.peer_hint(peer).unwrap(), None);
+
+        store
+            .connection
+            .pragma_update(None, "ignore_check_constraints", false)
+            .unwrap();
+        for rejected in [
+            "UPDATE peer_hints SET hint = '' WHERE endpoint_id = ?1",
+            "UPDATE peer_hints SET hint = CAST(zeroblob(1) AS BLOB) WHERE endpoint_id = ?1",
+            "UPDATE peer_hints SET hint = printf('%*s', 16385, '') WHERE endpoint_id = ?1",
+        ] {
+            assert!(
+                store
+                    .connection
+                    .execute(rejected, [peer.as_bytes()])
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -2704,13 +2746,13 @@ mod tests {
                 .is_err()
         );
         assert!(store.selected_roster_chain().unwrap().is_empty());
-        let oversized_hints = vec!["x".repeat(MAX_PEER_HINT_BYTES + 1)];
+        let oversized_hint = "x".repeat(MAX_PEER_HINT_BYTES + 1);
         assert!(
             store
                 .install_joined_state(
                     &[genesis.clone(), admission.clone()],
                     joiner.endpoint_id(),
-                    &[(creator.endpoint_id(), oversized_hints)]
+                    &[(creator.endpoint_id(), oversized_hint)]
                 )
                 .is_err()
         );
@@ -2730,12 +2772,13 @@ mod tests {
                 &[genesis.clone(), admission.clone()],
                 joiner.endpoint_id(),
                 "joiner",
-                &[(creator.endpoint_id(), vec!["refreshed".to_owned()])],
+                &[(creator.endpoint_id(), "refreshed".to_owned())],
             )
             .unwrap();
-        let refreshed = store.peer_hints(creator.endpoint_id()).unwrap();
-        assert_eq!(refreshed.len(), 1);
-        assert_eq!(refreshed[0].0, "refreshed");
+        assert_eq!(
+            store.peer_hint(creator.endpoint_id()).unwrap(),
+            Some("refreshed".to_owned())
+        );
         assert!(
             store
                 .install_or_resume_joined_state(

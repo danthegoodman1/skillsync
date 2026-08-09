@@ -16,6 +16,7 @@ use crate::identity::{DeviceIdentity, EndpointId};
 use crate::join::{
     JOIN_ALPN, JoinCoordinator, JoinDecision, JoinError, PendingJoinInfo, SecretNonce, run_inviter,
 };
+use crate::protocol::{MAX_ADDRESS_HINT_BYTES, MAX_ENDPOINT_ADDRS, ProtocolError};
 use crate::roster::{RosterChange, RosterMember};
 use crate::setup::now_ns;
 use crate::state::{OperationalEvent, StateError, StateStore};
@@ -264,7 +265,6 @@ fn build_join_approval_in(
         return Err(NetworkError::RemovedMember);
     }
     let peer_hints = approval_peer_hints(&state, pending, &identity, local_addr_json)?;
-    let joiner_hints = [joiner_addr.to_owned()];
     if active_name.is_none() {
         let change = RosterChange::Admit(RosterMember::new(
             pending.endpoint_id,
@@ -274,15 +274,14 @@ fn build_join_approval_in(
         let mut candidate_roster = roster;
         candidate_roster.push(candidate);
         JoinDecision::approved(candidate_roster, peer_hints.clone())?;
-        state.apply_roster_change_with_peer_hints(
+        state.apply_roster_change_with_peer_hint(
             &identity,
             change,
             pending.endpoint_id,
-            &joiner_hints,
-            now_ns(),
+            joiner_addr,
         )?;
     } else {
-        state.replace_peer_hints(pending.endpoint_id, &joiner_hints, now_ns())?;
+        state.replace_peer_hint(pending.endpoint_id, joiner_addr)?;
     }
     let roster = state.selected_roster_chain()?;
     if roster
@@ -301,7 +300,7 @@ fn approval_peer_hints(
     pending: &PendingJoinInfo,
     identity: &DeviceIdentity,
     local_addr_json: &str,
-) -> Result<BTreeMap<String, Vec<String>>, NetworkError> {
+) -> Result<BTreeMap<String, String>, NetworkError> {
     let roster = state.selected_roster_chain()?;
     let tip = roster.last().ok_or(NetworkError::MissingRoster)?;
     let mut peer_hints = BTreeMap::new();
@@ -309,18 +308,15 @@ fn approval_peer_hints(
         if endpoint == pending.endpoint_id {
             continue;
         }
-        let hints = if endpoint == identity.endpoint_id() {
-            vec![local_addr_json.to_owned()]
+        let hint = if endpoint == identity.endpoint_id() {
+            Some(local_addr_json.to_owned())
         } else {
             state
-                .peer_hints(endpoint)?
-                .into_iter()
-                .take(1)
-                .map(|(hint, _)| hint)
-                .collect()
+                .peer_hint(endpoint)?
+                .filter(|hint| decode_peer_hint(hint, endpoint).is_some())
         };
-        if !hints.is_empty() {
-            peer_hints.insert(endpoint.to_string(), hints);
+        if let Some(hint) = hint {
+            peer_hints.insert(endpoint.to_string(), hint);
         }
     }
     Ok(peer_hints)
@@ -614,30 +610,38 @@ fn spawn_incoming(
         let (peer, result, reconcile_again) = match connection {
             Ok(Ok(connection)) => {
                 let peer = endpoint_from_iroh(connection.remote_id());
-                if connection.alpn() == JOIN_ALPN {
-                    let result = run_inviter(connection, context.joins)
-                        .await
-                        .map(|_| peer)
-                        .map_err(|_| SyncError::JoinRejected);
-                    (peer, result, false)
-                } else {
-                    let session = SessionConfig::from_daemon(
-                        &context.paths,
-                        &context.config,
-                        context.local_endpoint,
-                        context.local_addr,
-                    );
-                    let outcome =
-                        run_session_with_outcome(connection, ConnectionSide::Acceptor, session)
-                            .await;
-                    let reconcile_again =
-                        outcome.as_ref().is_ok_and(|outcome| outcome.roster_changed)
-                            || matches!(
-                                outcome.as_ref(),
-                                Err(SyncError::RosterChangedAndUnauthorizedPeer)
-                            );
-                    let result = outcome.map(|outcome| outcome.remote_endpoint);
-                    (peer, result, reconcile_again)
+                match connection.alpn() {
+                    JOIN_ALPN => {
+                        let result = run_inviter(connection, context.joins)
+                            .await
+                            .map(|_| peer)
+                            .map_err(|_| SyncError::JoinRejected);
+                        (peer, result, false)
+                    }
+                    crate::protocol::ALPN => {
+                        let session = SessionConfig::from_daemon(
+                            &context.paths,
+                            &context.config,
+                            context.local_endpoint,
+                            context.local_addr,
+                        );
+                        let outcome =
+                            run_session_with_outcome(connection, ConnectionSide::Acceptor, session)
+                                .await;
+                        let reconcile_again =
+                            outcome.as_ref().is_ok_and(|outcome| outcome.roster_changed)
+                                || matches!(
+                                    outcome.as_ref(),
+                                    Err(SyncError::RosterChangedAndUnauthorizedPeer)
+                                );
+                        let result = outcome.map(|outcome| outcome.remote_endpoint);
+                        (peer, result, reconcile_again)
+                    }
+                    _ => (
+                        peer,
+                        Err(SyncError::Protocol(ProtocolError::UnexpectedFrame)),
+                        false,
+                    ),
                 }
             }
             _ => (
@@ -676,17 +680,25 @@ fn active_peers(
 
 fn peer_target(paths: &PlatformPaths, peer: EndpointId) -> Result<EndpointAddr, NetworkError> {
     let state = StateStore::open(&paths.data_dir.join("state.sqlite3"))?;
-    for (hint, _) in state.peer_hints(peer)? {
-        let Ok(addr) = serde_json::from_str::<EndpointAddr>(&hint) else {
-            continue;
-        };
-        if endpoint_from_iroh(addr.id) == peer {
-            return Ok(addr);
-        }
+    if let Some(hint) = state.peer_hint(peer)?
+        && let Some(addr) = decode_peer_hint(&hint, peer)
+    {
+        return Ok(addr);
     }
     Ok(EndpointAddr::new(
         endpoint_to_iroh(peer).map_err(NetworkError::Sync)?,
     ))
+}
+
+fn decode_peer_hint(encoded: &str, peer: EndpointId) -> Option<EndpointAddr> {
+    if encoded.is_empty() || encoded.len() > MAX_ADDRESS_HINT_BYTES {
+        return None;
+    }
+    let addr = serde_json::from_str::<EndpointAddr>(encoded).ok()?;
+    if endpoint_from_iroh(addr.id) != peer || addr.addrs.len() > MAX_ENDPOINT_ADDRS {
+        return None;
+    }
+    Some(addr)
 }
 
 fn record_attempt(paths: &PlatformPaths, config: &Config, peer: EndpointId) {
@@ -959,6 +971,81 @@ mod tests {
     }
 
     #[test]
+    fn peer_target_retains_valid_replacements_and_rejects_corrupt_stored_bundles() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = PlatformPaths {
+            config_file: temporary.path().join("config.toml"),
+            data_dir: temporary.path().join("data"),
+            runtime_dir: temporary.path().join("run"),
+        };
+        let peer = DeviceIdentity::from_secret([72; 32]).endpoint_id();
+        let assert_endpoint_only = || {
+            let fallback = peer_target(&paths, peer).unwrap();
+            assert_eq!(endpoint_from_iroh(fallback.id), peer);
+            assert!(fallback.addrs.is_empty());
+        };
+        assert_endpoint_only();
+
+        let old = EndpointAddr::new(endpoint_to_iroh(peer).unwrap())
+            .with_ip_addr("127.0.0.1:42000".parse().unwrap());
+        let old_encoded = serde_json::to_string(&old).unwrap();
+        StateStore::open(&paths.data_dir.join("state.sqlite3"))
+            .unwrap()
+            .replace_peer_hint(peer, &old_encoded)
+            .unwrap();
+        let expected = EndpointAddr::new(endpoint_to_iroh(peer).unwrap())
+            .with_ip_addr("127.0.0.1:42001".parse().unwrap())
+            .with_ip_addr("127.0.0.1:42002".parse().unwrap());
+        let encoded = serde_json::to_string(&expected).unwrap();
+        StateStore::open(&paths.data_dir.join("state.sqlite3"))
+            .unwrap()
+            .replace_peer_hint(peer, &encoded)
+            .unwrap();
+        let retained = peer_target(&paths, peer).unwrap();
+        assert_eq!(retained.id, expected.id);
+        assert_eq!(retained.addrs, expected.addrs);
+
+        StateStore::open(&paths.data_dir.join("state.sqlite3"))
+            .unwrap()
+            .replace_peer_hint(peer, "{")
+            .unwrap();
+        assert_endpoint_only();
+        let wrong_id = serde_json::to_string(&EndpointAddr::new(
+            endpoint_to_iroh(DeviceIdentity::from_secret([73; 32]).endpoint_id()).unwrap(),
+        ))
+        .unwrap();
+        StateStore::open(&paths.data_dir.join("state.sqlite3"))
+            .unwrap()
+            .replace_peer_hint(peer, &wrong_id)
+            .unwrap();
+        assert_endpoint_only();
+        let mut too_many = EndpointAddr::new(endpoint_to_iroh(peer).unwrap());
+        for port in 43_000..43_033 {
+            too_many = too_many.with_ip_addr(([127, 0, 0, 1], port).into());
+        }
+        let too_many = serde_json::to_string(&too_many).unwrap();
+        StateStore::open(&paths.data_dir.join("state.sqlite3"))
+            .unwrap()
+            .replace_peer_hint(peer, &too_many)
+            .unwrap();
+        assert_endpoint_only();
+
+        let database = paths.data_dir.join("state.sqlite3");
+        let connection = rusqlite::Connection::open(database).unwrap();
+        connection
+            .pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
+        for update in [
+            "UPDATE peer_hints SET hint = '' WHERE endpoint_id = ?1",
+            "UPDATE peer_hints SET hint = CAST(zeroblob(32) AS BLOB) WHERE endpoint_id = ?1",
+            "UPDATE peer_hints SET hint = printf('%*s', 16385, '') WHERE endpoint_id = ?1",
+        ] {
+            connection.execute(update, [peer.as_bytes()]).unwrap();
+            assert_endpoint_only();
+        }
+    }
+
+    #[test]
     fn failed_delivery_can_resume_the_same_member_and_refresh_its_hint() {
         let temporary = tempfile::tempdir().unwrap();
         let paths = PlatformPaths {
@@ -1023,9 +1110,10 @@ mod tests {
             chain.last().unwrap().members().get(&joiner.endpoint_id()),
             Some(&"joiner".to_owned())
         );
-        let saved_hints = state.peer_hints(joiner.endpoint_id()).unwrap();
-        assert_eq!(saved_hints.len(), 1);
-        assert_eq!(saved_hints[0].0, second_addr);
+        assert_eq!(
+            state.peer_hint(joiner.endpoint_id()).unwrap(),
+            Some(second_addr)
+        );
         drop(state);
 
         let mismatched = PendingJoinInfo {
@@ -1046,6 +1134,56 @@ mod tests {
             build_join_approval_in(&paths, &local_addr, &pending, &first_addr),
             Err(NetworkError::RemovedMember)
         ));
+    }
+
+    #[test]
+    fn joining_skips_an_unusable_non_inviter_bundle() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = PlatformPaths {
+            config_file: temporary.path().join("config.toml"),
+            data_dir: temporary.path().join("data"),
+            runtime_dir: temporary.path().join("run"),
+        };
+        let local = DeviceIdentity::from_secret([74; 32]);
+        let existing = DeviceIdentity::from_secret([75; 32]);
+        let joining = DeviceIdentity::from_secret([76; 32]);
+        let genesis = RosterRevision::genesis(
+            crate::identity::GroupId::from_bytes([77; 32]),
+            "local",
+            &local,
+        )
+        .unwrap();
+        let admission = RosterRevision::child(
+            &genesis,
+            RosterChange::Admit(RosterMember::new(existing.endpoint_id(), "existing").unwrap()),
+            &local,
+        )
+        .unwrap();
+        let mut state = StateStore::open(&paths.data_dir.join("state.sqlite3")).unwrap();
+        state.insert_roster_revision(&genesis).unwrap();
+        state.insert_roster_revision(&admission).unwrap();
+        state
+            .replace_peer_hint(existing.endpoint_id(), "{")
+            .unwrap();
+        let local_addr = serde_json::to_string(&EndpointAddr::new(
+            endpoint_to_iroh(local.endpoint_id()).unwrap(),
+        ))
+        .unwrap();
+        let hints = approval_peer_hints(
+            &state,
+            &PendingJoinInfo {
+                request_id: "joining".to_owned(),
+                endpoint_id: joining.endpoint_id(),
+                device_name: "joining".to_owned(),
+            },
+            &local,
+            &local_addr,
+        )
+        .unwrap();
+        assert_eq!(
+            hints,
+            BTreeMap::from([(local.endpoint_id().to_string(), local_addr)])
+        );
     }
 
     #[test]
@@ -1107,6 +1245,64 @@ mod tests {
             .unwrap();
         assert_eq!(endpoint_from_iroh(endpoint.id()), identity.endpoint_id());
         endpoint.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn incompatible_sync_and_join_alpns_fail_during_negotiation() {
+        let _guard = IROH_TEST_LOCK.lock().await;
+        let server_identity = DeviceIdentity::from_secret([45; 32]);
+        let client_identity = DeviceIdentity::from_secret([46; 32]);
+        let server = configured_builder(&Config::default(), &server_identity)
+            .unwrap()
+            .clear_address_lookup()
+            .relay_mode(RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let client = configured_builder(&Config::default(), &client_identity)
+            .unwrap()
+            .clear_address_lookup()
+            .relay_mode(RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+
+        for incompatible in [b"skillsync/2".as_slice(), b"skillsync-join/2".as_slice()] {
+            let accept_endpoint = server.clone();
+            let rejected = tokio::spawn(async move {
+                let incoming =
+                    tokio::time::timeout(Duration::from_secs(5), accept_endpoint.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let Ok(accepting) = incoming.accept() else {
+                    return true;
+                };
+                tokio::time::timeout(Duration::from_secs(5), accepting)
+                    .await
+                    .is_ok_and(|result| result.is_err())
+            });
+            let dial = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.connect(server.addr(), incompatible),
+            )
+            .await
+            .unwrap();
+            assert!(dial.is_err(), "incompatible ALPN negotiated");
+            assert!(
+                rejected.await.unwrap(),
+                "server accepted an application connection"
+            );
+        }
+
+        client.close().await;
+        server.close().await;
     }
 
     #[tokio::test]
@@ -1296,7 +1492,7 @@ mod tests {
         .unwrap();
         StateStore::open(&second_session.database)
             .unwrap()
-            .replace_peer_hints(first_session.local_endpoint, &[first_addr], 1)
+            .replace_peer_hint(first_session.local_endpoint, &first_addr)
             .unwrap();
         let second_network = NetworkHandle::start(second_paths.clone(), config, second).unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {

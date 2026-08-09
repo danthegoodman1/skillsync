@@ -166,8 +166,8 @@ Scope:
 
 - Build one persistent iroh endpoint with the `n0` preset and custom address
   lookup and relay configuration.
-- Implement framed `skillsync/1` messages with explicit version, size, path,
-  manifest, file, and connection limits.
+- Implement framed messages selected by the versioned `skillsync/1` ALPN with
+  size, path, manifest, file, and connection limits.
 - Authenticate the remote EndpointID, validate its selected roster revision,
   and exchange roster state before collection state.
 - Exchange complete manifests symmetrically, select winners, stream missing
@@ -191,7 +191,7 @@ the losing candidate cannot replace the deterministic winner.
 
 Testing plan:
 
-- Protocol codec tests for truncation, oversized frames, unknown versions,
+- Protocol codec tests for truncation, oversized frames, incompatible ALPNs,
   invalid paths, and unexpected message order.
 - Two-process convergence tests for file creation, edit, delete, equal-time
   ties, offline changes, and restart.
@@ -204,7 +204,7 @@ Status ledger:
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
 | Complete | Work | P3.1: Build configurable persistent iroh endpoints | One persistent identity-bound endpoint supports N0 defaults and custom address lookup and relay configuration. |
-| Complete | Work | P3.2: Implement bounded `skillsync/1` framing and handshake | Versioned frames enforce protocol, path, record, manifest, roster, transfer, hint, and connection limits. |
+| Complete | Work | P3.2: Implement bounded `skillsync/1` framing and handshake | The versioned ALPN and bounded frames enforce protocol, path, record, manifest, roster, transfer, hint, and connection limits. |
 | Complete | Work | P3.3: Implement symmetric manifest comparison and file transfer | Concurrent symmetric exchange converges deterministic winners and validates staged bytes before atomic installation. |
 | Complete | Work | P3.4: Implement reconciliation triggers and peer health reporting | Startup, local-change, explicit, and interval triggers are covered with bounded typed health logs. |
 | Complete | Work | P3.5: Implement degraded-path repair from a reachable winner | Repair-only scans request reconciliation and unavailable paths do not block transferable siblings. |

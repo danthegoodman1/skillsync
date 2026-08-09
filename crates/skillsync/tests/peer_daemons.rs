@@ -355,18 +355,16 @@ fn connect_hints(first: &DeviceFixture, second: &DeviceFixture) {
         .id;
     let mut first_state = StateStore::open(&first.paths.data_dir.join("state.sqlite3")).unwrap();
     first_state
-        .replace_peer_hints(
+        .replace_peer_hint(
             skillsync::sync::endpoint_from_iroh(second_endpoint),
-            &[second_addr],
-            1,
+            &second_addr,
         )
         .unwrap();
     let mut second_state = StateStore::open(&second.paths.data_dir.join("state.sqlite3")).unwrap();
     second_state
-        .replace_peer_hints(
+        .replace_peer_hint(
             skillsync::sync::endpoint_from_iroh(first_endpoint),
-            &[first_addr],
-            1,
+            &first_addr,
         )
         .unwrap();
 }
@@ -675,7 +673,7 @@ fn third_device_joins_one_member_learns_every_peer_syncs_and_is_refused_after_re
         .unwrap()
         .0
         .endpoint_id();
-    assert!(!third_state.peer_hints(second_endpoint).unwrap().is_empty());
+    assert!(third_state.peer_hint(second_endpoint).unwrap().is_some());
     drop(third_state);
     let peers = third
         .command()

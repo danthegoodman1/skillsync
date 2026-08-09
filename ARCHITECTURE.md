@@ -251,16 +251,18 @@ skillsync-join/1
 ```
 
 `skillsync-join/1` carries the nonce proof, EndpointID approval, signed
-membership grant, complete roster, and initial peer hints. `skillsync/1`
+membership grant, complete roster, and initial peer EndpointAddr bundles.
+`skillsync/1`
 carries synchronization between current members. Each synchronization
 connection follows this shape:
 
 1. The iroh handshake authenticates both EndpointIDs and encrypts the channel.
-2. Peers exchange protocol version, group identity, device name, roster digest,
-   and attached collection names.
-3. Unknown, removed, or wrong-group identities are refused.
-4. Approved peers exchange complete signed roster chains and deterministically
-   select the current chain.
+2. Peers exchange attached collection names and their current iroh EndpointAddr
+   bundles.
+3. Peers exchange complete signed roster chains and deterministically select
+   the current chain.
+4. Unknown, removed, or wrong-group identities are refused. An authenticated
+   peer's EndpointAddr bundle replaces its previous bundle.
 5. For every collection attached at both ends, peers exchange complete
    manifests.
 6. Each side deterministically selects winning records and requests missing
@@ -327,7 +329,7 @@ comparison.
 
 Approval commits the signed admission before sending the roster to the joiner.
 If delivery is interrupted, a fresh invitation for the same EndpointID and
-device name refreshes its address hint and sends the current roster. A
+device name refreshes its EndpointAddr bundle and sends the current roster. A
 different name or a previously removed EndpointID is refused.
 
 The joining service's role ends after returning the inviter's ticket and join
@@ -358,9 +360,9 @@ current roster. A device that was offline adopts the selected revision chain
 when it next reaches a current member. An isolated peer continues using the
 last roster revision it received.
 
-The peer list contains EndpointIDs and the most recent usable iroh addressing
-hints. EndpointIDs and signed roster revisions establish identity and
-membership. Addressing hints are replaceable observations.
+The peer list contains EndpointIDs and each peer's most recent usable iroh
+EndpointAddr bundle. EndpointIDs and signed roster revisions establish identity
+and membership. A peer's EndpointAddr bundle is a replaceable observation.
 
 ## Local state
 
@@ -371,7 +373,7 @@ SQLite stores only the state needed to restart safely:
 - configured collection names, paths, and resolved roots
 - the winning record for each known path, including tombstones, and the
   observed fingerprint for its current materialized file
-- peer EndpointIDs and recent iroh address hints
+- peer EndpointIDs and each peer's current iroh EndpointAddr bundle
 - a bounded operational log
 
 Skill contents live in configured collection directories and temporary transfer
@@ -444,7 +446,7 @@ The codebase has three internal responsibility areas:
 - **Joining service:** the Cloudflare Worker and Durable Object implementing the
   small HTTP API in [JOINING_SERVICE.md](JOINING_SERVICE.md).
 
-Protocol structures have explicit versions. Membership records have
+Versioned ALPNs identify the peer protocols. Membership records have
 deterministic serialization for signing. Compatibility covers the peer
 protocol, joining API, and CLI JSON shapes within their stated versions.
 

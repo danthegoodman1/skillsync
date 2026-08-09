@@ -14,10 +14,10 @@ use crate::installer::{
     InstallError, apply_file_fixture, materialize_tombstone, open_verified_file,
 };
 use crate::protocol::{
-    FileRequest, FrameTag, Hello, IO_IDLE_TIMEOUT, MAX_ENDPOINT_ADDRS, MAX_SESSION_FILE_BYTES,
-    MAX_TRANSFERS, ManifestBundle, ProtocolError, ReceiveState, RequestBundle, RosterBundle,
-    add_received, decode_file_header, decode_file_unavailable, encode_file_header,
-    encode_file_unavailable, read_frame_async, write_frame_async,
+    FileRequest, FrameTag, Hello, IO_IDLE_TIMEOUT, MAX_ADDRESS_HINT_BYTES, MAX_ENDPOINT_ADDRS,
+    MAX_SESSION_FILE_BYTES, MAX_TRANSFERS, ManifestBundle, ProtocolError, RequestBundle,
+    RosterBundle, add_received, decode_file_header, encode_file_header, expect_frame_tag,
+    read_frame_async, write_frame_async,
 };
 use crate::record::{Manifest, RecordKind};
 use crate::setup::now_ns;
@@ -91,23 +91,16 @@ pub(crate) async fn run_session_with_outcome(
             .map_err(|_| SyncError::Transport)?,
     };
     let mut received_bytes = 0_u64;
-    let mut receive_state = ReceiveState::Hello;
-
     let (local_chain, local_collections) = local_session_state(&config.database)?;
-    let local_genesis = local_chain.first().ok_or(SyncError::MissingRoster)?;
-    let local_tip = local_chain.last().ok_or(SyncError::MissingRoster)?;
-    let local_name = local_tip
-        .members()
-        .get(&config.local_endpoint)
-        .ok_or(SyncError::UnauthorizedPeer)?;
+    let local_genesis_hash = local_chain
+        .first()
+        .ok_or(SyncError::MissingRoster)?
+        .canonical_hash();
     if config.local_addr.addrs.len() > MAX_ENDPOINT_ADDRS {
         return Err(SyncError::HintAddressLimit);
     }
     let local_addr_json = serde_json::to_string(&config.local_addr)?;
     let hello = Hello {
-        group_id: local_genesis.group_id(),
-        device_name: local_name.clone(),
-        roster_hash: *local_tip.canonical_hash().as_bytes(),
         collections: local_collections.clone(),
         endpoint_addr_json: local_addr_json,
     };
@@ -116,22 +109,12 @@ pub(crate) async fn run_session_with_outcome(
         &exchange_frame(
             &mut send,
             &mut recv,
-            &mut receive_state,
             FrameTag::Hello,
             &hello,
             &mut received_bytes,
         )
         .await?,
     )?;
-    if remote_hello.group_id != local_genesis.group_id() {
-        return Err(SyncError::WrongGroup);
-    }
-    persist_remote_hint(
-        &config.database,
-        remote_endpoint,
-        &remote_hello.endpoint_addr_json,
-    )?;
-
     let local_roster = RosterBundle {
         revisions: local_chain,
     }
@@ -140,26 +123,19 @@ pub(crate) async fn run_session_with_outcome(
         &exchange_frame(
             &mut send,
             &mut recv,
-            &mut receive_state,
             FrameTag::Roster,
             &local_roster,
             &mut received_bytes,
         )
         .await?,
     )?;
-    if remote_roster
-        .revisions
-        .last()
-        .is_none_or(|revision| revision.canonical_hash().as_bytes() != &remote_hello.roster_hash)
-    {
-        return Err(SyncError::RosterDigestMismatch);
-    }
-    let roster_changed = merge_and_authorize_remote_roster(
+    let roster_changed = accept_remote_roster_and_hint(
         &config.database,
         &remote_roster.revisions,
+        local_genesis_hash,
         config.local_endpoint,
         remote_endpoint,
-        &remote_hello.device_name,
+        &remote_hello.endpoint_addr_json,
     )?;
 
     let remote_collections = remote_hello
@@ -176,7 +152,6 @@ pub(crate) async fn run_session_with_outcome(
         &exchange_frame(
             &mut send,
             &mut recv,
-            &mut receive_state,
             FrameTag::Manifests,
             &local_manifests,
             &mut received_bytes,
@@ -193,15 +168,12 @@ pub(crate) async fn run_session_with_outcome(
         &exchange_frame(
             &mut send,
             &mut recv,
-            &mut receive_state,
             FrameTag::Requests,
             &local_requests,
             &mut received_bytes,
         )
         .await?,
     )?;
-    receive_state.expect_files(requests.len())?;
-
     match side {
         ConnectionSide::Dialer => {
             send_files(
@@ -216,7 +188,6 @@ pub(crate) async fn run_session_with_outcome(
                 &config,
                 remote_endpoint,
                 &mut recv,
-                &mut receive_state,
                 &mut received_bytes,
                 &requests,
             )
@@ -227,7 +198,6 @@ pub(crate) async fn run_session_with_outcome(
                 &config,
                 remote_endpoint,
                 &mut recv,
-                &mut receive_state,
                 &mut received_bytes,
                 &requests,
             )
@@ -246,13 +216,12 @@ pub(crate) async fn run_session_with_outcome(
     let done = exchange_frame(
         &mut send,
         &mut recv,
-        &mut receive_state,
         FrameTag::Done,
         &[],
         &mut received_bytes,
     )
     .await?;
-    if !done.is_empty() || receive_state != ReceiveState::Finished {
+    if !done.is_empty() {
         return Err(SyncError::UnexpectedState);
     }
     send.finish().map_err(|_| SyncError::Transport)?;
@@ -310,7 +279,6 @@ fn merge_and_authorize_remote_roster(
     revisions: &[crate::roster::RosterRevision],
     local_endpoint: EndpointId,
     remote_endpoint: EndpointId,
-    remote_name: &str,
 ) -> Result<bool, SyncError> {
     let mut state = StateStore::open(database)?;
     let previous = state.selected_roster_chain()?;
@@ -354,17 +322,26 @@ fn merge_and_authorize_remote_roster(
             SyncError::UnauthorizedPeer
         });
     }
-    if tip.members().get(&remote_endpoint).map(String::as_str) != Some(remote_name) {
-        return Err(SyncError::DeviceNameMismatch);
-    }
     Ok(roster_changed)
 }
 
-fn persist_remote_hint(
+fn accept_remote_roster_and_hint(
     database: &Path,
+    revisions: &[crate::roster::RosterRevision],
+    local_genesis_hash: crate::roster::RosterHash,
+    local_endpoint: EndpointId,
     remote_endpoint: EndpointId,
     encoded: &str,
-) -> Result<(), SyncError> {
+) -> Result<bool, SyncError> {
+    if revisions
+        .first()
+        .is_none_or(|revision| revision.canonical_hash() != local_genesis_hash)
+    {
+        return Err(SyncError::WrongGroup);
+    }
+    if encoded.is_empty() || encoded.len() > MAX_ADDRESS_HINT_BYTES {
+        return Err(SyncError::Protocol(ProtocolError::AddressHintTooLarge));
+    }
     let addr: EndpointAddr = serde_json::from_str(encoded)?;
     if endpoint_from_iroh(addr.id) != remote_endpoint {
         return Err(SyncError::HintIdentityMismatch);
@@ -372,9 +349,11 @@ fn persist_remote_hint(
     if addr.addrs.len() > MAX_ENDPOINT_ADDRS {
         return Err(SyncError::HintAddressLimit);
     }
+    let roster_changed =
+        merge_and_authorize_remote_roster(database, revisions, local_endpoint, remote_endpoint)?;
     let mut state = StateStore::open(database)?;
-    state.replace_peer_hints(remote_endpoint, &[encoded.to_owned()], now_ns())?;
-    Ok(())
+    state.replace_peer_hint(remote_endpoint, encoded)?;
+    Ok(roster_changed)
 }
 
 fn build_manifests(database: &Path, shared: &[String]) -> Result<ManifestBundle, SyncError> {
@@ -522,23 +501,13 @@ async fn send_files(
         let Some((record, mut file, size)) =
             prepare_requested_file(config, remote_endpoint, request)?
         else {
-            write_frame_async(
-                send,
-                FrameTag::FileUnavailable,
-                &encode_file_unavailable(request)?,
-            )
-            .await?;
+            write_frame_async(send, FrameTag::FileUnavailable, &[]).await?;
             continue;
         };
         let next_sent = sent_bytes.checked_add(size);
         if next_sent.is_none_or(|bytes| bytes > MAX_SESSION_FILE_BYTES) {
             log_unavailable(config, remote_endpoint, request, false)?;
-            write_frame_async(
-                send,
-                FrameTag::FileUnavailable,
-                &encode_file_unavailable(request)?,
-            )
-            .await?;
+            write_frame_async(send, FrameTag::FileUnavailable, &[]).await?;
             continue;
         }
         sent_bytes = next_sent.expect("checked above");
@@ -669,7 +638,6 @@ async fn receive_files(
     config: &SessionConfig,
     remote_endpoint: EndpointId,
     recv: &mut RecvStream,
-    state_machine: &mut ReceiveState,
     received_bytes: &mut u64,
     requests: &[FileRequest],
 ) -> Result<(), SyncError> {
@@ -678,10 +646,9 @@ async fn receive_files(
         if !matches!(tag, FrameTag::File | FrameTag::FileUnavailable) {
             return Err(SyncError::Protocol(ProtocolError::UnexpectedFrame));
         }
-        state_machine.accept(tag)?;
         if tag == FrameTag::FileUnavailable {
-            if decode_file_unavailable(&header)? != *request {
-                return Err(SyncError::UnsolicitedFile);
+            if !header.is_empty() {
+                return Err(SyncError::Protocol(ProtocolError::UnexpectedFrame));
             }
             log_unavailable(config, remote_endpoint, request, false)?;
             continue;
@@ -788,22 +755,17 @@ async fn receive_raw_file(
 
 async fn read_expected(
     recv: &mut RecvStream,
-    state: &mut ReceiveState,
     expected: FrameTag,
     received_bytes: &mut u64,
 ) -> Result<Vec<u8>, SyncError> {
     let (tag, payload) = read_frame_async(recv, received_bytes).await?;
-    if tag != expected {
-        return Err(SyncError::Protocol(ProtocolError::UnexpectedFrame));
-    }
-    state.accept(tag)?;
+    expect_frame_tag(tag, expected)?;
     Ok(payload)
 }
 
 async fn exchange_frame(
     send: &mut SendStream,
     recv: &mut RecvStream,
-    state: &mut ReceiveState,
     tag: FrameTag,
     local_payload: &[u8],
     received_bytes: &mut u64,
@@ -813,7 +775,7 @@ async fn exchange_frame(
             .await
             .map_err(SyncError::from)
     };
-    let read = read_expected(recv, state, tag, received_bytes);
+    let read = read_expected(recv, tag, received_bytes);
     let ((), remote_payload) = tokio::try_join!(write, read)?;
     Ok(remote_payload)
 }
@@ -844,10 +806,6 @@ pub enum SyncError {
     RosterChangedAndUnauthorizedPeer,
     #[error("peer belongs to a different group")]
     WrongGroup,
-    #[error("peer roster digest does not match the exchanged roster")]
-    RosterDigestMismatch,
-    #[error("peer device name does not match the selected roster")]
-    DeviceNameMismatch,
     #[error("peer advertised unexpected collections")]
     WrongCollections,
     #[error("peer address hint names a different EndpointID")]
@@ -959,9 +917,127 @@ mod tests {
             &[genesis, child],
             local.endpoint_id(),
             remote.endpoint_id(),
-            "remote",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn unauthenticated_hello_hints_never_replace_the_current_bundle() {
+        let local = DeviceIdentity::from_secret([11; 32]);
+        let remote = DeviceIdentity::from_secret([12; 32]);
+        let outsider = DeviceIdentity::from_secret([13; 32]);
+        let third = DeviceIdentity::from_secret([14; 32]);
+        let genesis =
+            RosterRevision::genesis(GroupId::from_bytes([14; 32]), "local", &local).unwrap();
+        let admission = RosterRevision::child(
+            &genesis,
+            RosterChange::Admit(RosterMember::new(remote.endpoint_id(), "remote").unwrap()),
+            &local,
+        )
+        .unwrap();
+        let remote_update = RosterRevision::child(
+            &admission,
+            RosterChange::Admit(RosterMember::new(third.endpoint_id(), "third").unwrap()),
+            &remote,
+        )
+        .unwrap();
+        let removal = RosterRevision::child(
+            &admission,
+            RosterChange::Remove(remote.endpoint_id()),
+            &local,
+        )
+        .unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let database = temporary.path().join("state.sqlite3");
+        let current = serde_json::to_string(
+            &EndpointAddr::new(endpoint_to_iroh(remote.endpoint_id()).unwrap())
+                .with_ip_addr("127.0.0.1:41001".parse().unwrap()),
+        )
+        .unwrap();
+        let replacement = serde_json::to_string(
+            &EndpointAddr::new(endpoint_to_iroh(remote.endpoint_id()).unwrap())
+                .with_ip_addr("127.0.0.1:41002".parse().unwrap()),
+        )
+        .unwrap();
+        let mismatched = serde_json::to_string(&EndpointAddr::new(
+            endpoint_to_iroh(outsider.endpoint_id()).unwrap(),
+        ))
+        .unwrap();
+        let mut state = StateStore::open(&database).unwrap();
+        state.insert_roster_revision(&genesis).unwrap();
+        state.insert_roster_revision(&admission).unwrap();
+        state
+            .replace_peer_hint(remote.endpoint_id(), &current)
+            .unwrap();
+        drop(state);
+
+        assert!(matches!(
+            accept_remote_roster_and_hint(
+                &database,
+                &[genesis.clone(), admission.clone(), remote_update,],
+                genesis.canonical_hash(),
+                local.endpoint_id(),
+                remote.endpoint_id(),
+                &mismatched,
+            ),
+            Err(SyncError::HintIdentityMismatch)
+        ));
+        assert_eq!(
+            StateStore::open(&database)
+                .unwrap()
+                .selected_roster_chain()
+                .unwrap(),
+            vec![genesis.clone(), admission.clone()]
+        );
+        assert_eq!(
+            StateStore::open(&database)
+                .unwrap()
+                .peer_hint(remote.endpoint_id())
+                .unwrap(),
+            Some(current.clone())
+        );
+
+        let wrong_genesis =
+            RosterRevision::genesis(GroupId::from_bytes([15; 32]), "local", &local).unwrap();
+        let wrong_admission = RosterRevision::child(
+            &wrong_genesis,
+            RosterChange::Admit(RosterMember::new(remote.endpoint_id(), "remote").unwrap()),
+            &local,
+        )
+        .unwrap();
+        assert!(matches!(
+            accept_remote_roster_and_hint(
+                &database,
+                &[wrong_genesis, wrong_admission],
+                genesis.canonical_hash(),
+                local.endpoint_id(),
+                remote.endpoint_id(),
+                &replacement,
+            ),
+            Err(SyncError::WrongGroup)
+        ));
+
+        let mut state = StateStore::open(&database).unwrap();
+        state.insert_roster_revision(&removal).unwrap();
+        drop(state);
+        assert!(matches!(
+            accept_remote_roster_and_hint(
+                &database,
+                &[genesis.clone(), admission],
+                genesis.canonical_hash(),
+                local.endpoint_id(),
+                remote.endpoint_id(),
+                &replacement,
+            ),
+            Err(SyncError::UnauthorizedPeer)
+        ));
+        assert_eq!(
+            StateStore::open(&database)
+                .unwrap()
+                .peer_hint(remote.endpoint_id())
+                .unwrap(),
+            Some(current)
+        );
     }
 
     #[test]
@@ -980,11 +1056,11 @@ mod tests {
             RosterChange::Admit(RosterMember::new(second.endpoint_id(), "second").unwrap());
         let first_child = RosterRevision::child(&genesis, first_change.clone(), &local).unwrap();
         let second_child = RosterRevision::child(&genesis, second_change.clone(), &local).unwrap();
-        let (loser, winner, remote_endpoint, remote_name) =
+        let (loser, winner, remote_endpoint) =
             if first_child.canonical_hash() < second_child.canonical_hash() {
-                (first_child, second_child, second.endpoint_id(), "second")
+                (first_child, second_child, second.endpoint_id())
             } else {
-                (second_child, first_child, first.endpoint_id(), "first")
+                (second_child, first_child, first.endpoint_id())
             };
         let temporary = tempfile::tempdir().unwrap();
         let database = temporary.path().join("state.sqlite3");
@@ -1015,7 +1091,6 @@ mod tests {
                 &[genesis.clone(), winner.clone()],
                 local.endpoint_id(),
                 remote_endpoint,
-                remote_name,
             )
             .unwrap()
         );
@@ -1099,7 +1174,6 @@ mod tests {
                 &[genesis.clone(), winner.clone()],
                 local.endpoint_id(),
                 joining.endpoint_id(),
-                &selected_name,
             )
             .unwrap()
         );
@@ -1109,7 +1183,6 @@ mod tests {
                 &[genesis, winner],
                 local.endpoint_id(),
                 joining.endpoint_id(),
-                &selected_name,
             )
             .unwrap()
         );
@@ -1158,7 +1231,6 @@ mod tests {
                 &[genesis.clone(), parent.clone(), update.clone()],
                 local.endpoint_id(),
                 remote.endpoint_id(),
-                "remote",
             )
             .unwrap()
         );
@@ -1168,7 +1240,6 @@ mod tests {
                 &[genesis, parent, update],
                 local.endpoint_id(),
                 remote.endpoint_id(),
-                "remote",
             )
             .unwrap()
         );
@@ -1249,7 +1320,6 @@ mod tests {
                 &[genesis, parent, remote_winner],
                 local.endpoint_id(),
                 remote.endpoint_id(),
-                "remote",
             ),
             Err(SyncError::RosterChangedAndUnauthorizedPeer)
         ));

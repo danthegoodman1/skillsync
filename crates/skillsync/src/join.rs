@@ -12,14 +12,14 @@ use iroh::endpoint::Connection;
 use iroh_tickets::endpoint::EndpointTicket;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::config::{Config, PlatformPaths};
 use crate::identity::{DeviceIdentity, EndpointId};
 use crate::network::bind_endpoint;
-use crate::protocol::{MAX_ENDPOINT_ADDRS, MAX_ROSTER_BYTES, MAX_ROSTER_REVISIONS, RosterBundle};
+use crate::protocol::{MAX_ENDPOINT_ADDRS, MAX_ROSTER_BYTES, RosterBundle};
 use crate::roster::RosterRevision;
 use crate::state::{StateError, StateStore};
 use crate::sync::{endpoint_from_iroh, endpoint_to_iroh};
@@ -97,27 +97,28 @@ struct PendingJoin {
 
 pub struct JoinDecision {
     approved: bool,
-    roster: Vec<RosterRevision>,
-    peer_hints: BTreeMap<String, Vec<String>>,
+    roster: String,
+    peer_hints: BTreeMap<String, String>,
 }
 
 impl JoinDecision {
     pub fn rejected() -> Self {
         Self {
             approved: false,
-            roster: Vec::new(),
+            roster: String::new(),
             peer_hints: BTreeMap::new(),
         }
     }
 
     pub fn approved(
         roster: Vec<RosterRevision>,
-        peer_hints: BTreeMap<String, Vec<String>>,
+        peer_hints: BTreeMap<String, String>,
     ) -> Result<Self, JoinError> {
-        validate_approval_payload(&roster, &peer_hints)?;
+        let encoded_roster = encode_roster(&roster)?;
+        validate_approval_payload(&roster, &encoded_roster, &peer_hints)?;
         Ok(Self {
             approved: true,
-            roster,
+            roster: encoded_roster,
             peer_hints,
         })
     }
@@ -299,7 +300,6 @@ async fn run_joiner_on_endpoint(
         .map_err(|_| JoinError::Timeout)?
         .map_err(|_| JoinError::Transport)?;
     let request = JoinRequest {
-        protocol: "skillsync/1".to_owned(),
         nonce,
         device_name: device_name.to_owned(),
         endpoint_addr_json: serde_json::to_string(&endpoint.addr())
@@ -324,19 +324,17 @@ async fn run_joiner_on_endpoint(
         return Err(JoinError::InvalidRoster);
     }
     let mut validated_hints = Vec::new();
-    for (endpoint, hints) in response.peer_hints {
+    for (endpoint, hint) in response.peer_hints {
         let endpoint = EndpointId::from_str(&endpoint).map_err(|_| JoinError::InvalidAddress)?;
         if !tip.members().contains_key(&endpoint) || endpoint == identity.endpoint_id() {
             return Err(JoinError::InvalidAddress);
         }
-        for hint in &hints {
-            validate_endpoint_addr(hint, endpoint)?;
-        }
-        validated_hints.push((endpoint, hints));
+        validate_endpoint_addr(&hint, endpoint)?;
+        validated_hints.push((endpoint, hint));
     }
     if !validated_hints
         .iter()
-        .any(|(endpoint, hints)| *endpoint == inviter && !hints.is_empty())
+        .any(|(endpoint, _)| *endpoint == inviter)
     {
         return Err(JoinError::InvalidAddress);
     }
@@ -375,9 +373,6 @@ pub async fn run_inviter(
         .map_err(|_| JoinError::Timeout)?
         .map_err(|_| JoinError::Transport)?;
     let request: JoinRequest = read_json(&mut recv, JOIN_REQUEST_LIMIT).await?;
-    if request.protocol != "skillsync/1" {
-        return Err(JoinError::WrongProtocol);
-    }
     let (decision, remaining, request_id) = coordinator.claim(
         &request.nonce,
         remote_endpoint,
@@ -405,13 +400,13 @@ pub async fn run_inviter(
     let response = if decision.approved {
         JoinResponse {
             approved: true,
-            roster: encode_roster(&decision.roster)?,
+            roster: decision.roster,
             peer_hints: decision.peer_hints,
         }
     } else {
         JoinResponse {
             approved: false,
-            roster: Vec::new(),
+            roster: String::new(),
             peer_hints: BTreeMap::new(),
         }
     };
@@ -439,7 +434,6 @@ pub async fn run_inviter(
 
 #[derive(Deserialize, Serialize)]
 struct JoinRequest {
-    protocol: String,
     nonce: [u8; 32],
     device_name: String,
     endpoint_addr_json: String,
@@ -449,7 +443,6 @@ impl fmt::Debug for JoinRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("JoinRequest")
-            .field("protocol", &self.protocol)
             .field("nonce", &"[redacted]")
             .field("device_name", &self.device_name)
             .field("endpoint_addr_json", &"[redacted address]")
@@ -460,8 +453,8 @@ impl fmt::Debug for JoinRequest {
 #[derive(Deserialize, Serialize)]
 struct JoinResponse {
     approved: bool,
-    roster: Vec<String>,
-    peer_hints: BTreeMap<String, Vec<String>>,
+    roster: String,
+    peer_hints: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -469,46 +462,41 @@ struct JoinAck {
     accepted: bool,
 }
 
-fn encode_roster(revisions: &[RosterRevision]) -> Result<Vec<String>, JoinError> {
-    RosterBundle {
+fn encode_roster(revisions: &[RosterRevision]) -> Result<String, JoinError> {
+    let canonical = RosterBundle {
         revisions: revisions.to_vec(),
     }
     .encode()
     .map_err(|_| JoinError::InvalidRoster)?;
-    Ok(revisions
-        .iter()
-        .map(|revision| URL_SAFE_NO_PAD.encode(revision.canonical_bytes()))
-        .collect())
+    Ok(URL_SAFE_NO_PAD.encode(canonical))
 }
 
 fn validate_approval_payload(
     roster: &[RosterRevision],
-    peer_hints: &BTreeMap<String, Vec<String>>,
+    encoded_roster: &str,
+    peer_hints: &BTreeMap<String, String>,
 ) -> Result<(), JoinError> {
-    let encoded_roster = encode_roster(roster)?;
     let tip = roster.last().ok_or(JoinError::InvalidRoster)?;
     let mut hint_text_bytes = 0_usize;
-    for (endpoint, hints) in peer_hints {
+    for (endpoint, hint) in peer_hints {
         let endpoint_id = EndpointId::from_str(endpoint).map_err(|_| JoinError::InvalidAddress)?;
-        if !tip.members().contains_key(&endpoint_id) || hints.is_empty() {
+        if !tip.members().contains_key(&endpoint_id) {
             return Err(JoinError::InvalidAddress);
         }
         hint_text_bytes = hint_text_bytes
             .checked_add(endpoint.len())
             .ok_or(JoinError::FrameTooLarge)?;
-        for hint in hints {
-            validate_endpoint_addr(hint, endpoint_id)?;
-            hint_text_bytes = hint_text_bytes
-                .checked_add(hint.len())
-                .ok_or(JoinError::FrameTooLarge)?;
-        }
+        validate_endpoint_addr(hint, endpoint_id)?;
+        hint_text_bytes = hint_text_bytes
+            .checked_add(hint.len())
+            .ok_or(JoinError::FrameTooLarge)?;
     }
     if hint_text_bytes > MAX_JOIN_HINT_TEXT_BYTES {
         return Err(JoinError::FrameTooLarge);
     }
     let response = JoinResponse {
         approved: true,
-        roster: encoded_roster,
+        roster: encoded_roster.to_owned(),
         peer_hints: peer_hints.clone(),
     };
     if serde_json::to_vec(&response)
@@ -521,36 +509,23 @@ fn validate_approval_payload(
     Ok(())
 }
 
-fn decode_roster(encoded: &[String]) -> Result<Vec<RosterRevision>, JoinError> {
-    if encoded.is_empty() || encoded.len() > MAX_ROSTER_REVISIONS {
+fn decode_roster(encoded: &str) -> Result<Vec<RosterRevision>, JoinError> {
+    if encoded.is_empty() {
         return Err(JoinError::InvalidRoster);
     }
-    let mut revisions = Vec::with_capacity(encoded.len());
-    let mut bytes = 0_usize;
-    for revision in encoded {
-        let canonical = URL_SAFE_NO_PAD
-            .decode(revision)
-            .map_err(|_| JoinError::InvalidRoster)?;
-        bytes = bytes
-            .checked_add(canonical.len())
-            .ok_or(JoinError::InvalidRoster)?;
-        if bytes > MAX_ROSTER_BYTES {
-            return Err(JoinError::InvalidRoster);
-        }
-        revisions.push(
-            RosterRevision::from_canonical(&canonical).map_err(|_| JoinError::InvalidRoster)?,
-        );
+    let canonical = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| JoinError::InvalidRoster)?;
+    if canonical.len() > MAX_ROSTER_BYTES {
+        return Err(JoinError::InvalidRoster);
     }
-    RosterBundle {
-        revisions: revisions.clone(),
-    }
-    .encode()
-    .map_err(|_| JoinError::InvalidRoster)?;
-    Ok(revisions)
+    Ok(RosterBundle::decode(&canonical)
+        .map_err(|_| JoinError::InvalidRoster)?
+        .revisions)
 }
 
-async fn write_json<T: Serialize>(
-    stream: &mut iroh::endpoint::SendStream,
+async fn write_json<T: Serialize, W: AsyncWrite + Unpin>(
+    stream: &mut W,
     value: &T,
     limit: usize,
 ) -> Result<(), JoinError> {
@@ -697,8 +672,6 @@ pub enum JoinError {
     InvalidTicket,
     #[error("joining device name is invalid")]
     InvalidDeviceName,
-    #[error("join protocol is incompatible")]
-    WrongProtocol,
     #[error("connected inviter does not match the ticket")]
     WrongInviter,
     #[error("join request was rejected")]
@@ -760,6 +733,73 @@ mod tests {
             .bind()
             .await
             .unwrap()
+    }
+
+    #[test]
+    fn join_response_carries_one_validated_canonical_roster_bundle() {
+        let creator = identity(1);
+        let joiner = identity(2);
+        let genesis =
+            RosterRevision::genesis(GroupId::from_bytes([3; 32]), "creator", &creator).unwrap();
+        let admission = RosterRevision::child(
+            &genesis,
+            RosterChange::Admit(RosterMember::new(joiner.endpoint_id(), "joiner").unwrap()),
+            &creator,
+        )
+        .unwrap();
+        let roster = vec![genesis, admission];
+        let encoded = encode_roster(&roster).unwrap();
+        assert_eq!(decode_roster(&encoded).unwrap(), roster);
+        let response = JoinResponse {
+            approved: true,
+            roster: encoded.clone(),
+            peer_hints: BTreeMap::new(),
+        };
+        assert!(serde_json::to_value(response).unwrap()["roster"].is_string());
+
+        let mut trailing = URL_SAFE_NO_PAD.decode(encoded).unwrap();
+        trailing.push(0);
+        assert!(matches!(
+            decode_roster(&URL_SAFE_NO_PAD.encode(trailing)),
+            Err(JoinError::InvalidRoster)
+        ));
+        assert!(matches!(
+            decode_roster(&URL_SAFE_NO_PAD.encode(vec![0; MAX_ROSTER_BYTES + 1])),
+            Err(JoinError::InvalidRoster)
+        ));
+    }
+
+    #[tokio::test]
+    async fn join_json_frames_enforce_the_exact_byte_limit() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let exact = "x".repeat(JOIN_REQUEST_LIMIT - 2);
+        let (mut writer, mut reader) = tokio::io::duplex(JOIN_REQUEST_LIMIT + 4);
+        write_json(&mut writer, &exact, JOIN_REQUEST_LIMIT)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_json::<String, _>(&mut reader, JOIN_REQUEST_LIMIT)
+                .await
+                .unwrap(),
+            exact
+        );
+
+        let over = "x".repeat(JOIN_REQUEST_LIMIT - 1);
+        assert!(matches!(
+            write_json(&mut writer, &over, JOIN_REQUEST_LIMIT).await,
+            Err(JoinError::FrameTooLarge)
+        ));
+
+        let (mut writer, mut reader) = tokio::io::duplex(4);
+        writer
+            .write_all(&u32::try_from(JOIN_REQUEST_LIMIT + 1).unwrap().to_be_bytes())
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_json::<JoinAck, _>(&mut reader, JOIN_REQUEST_LIMIT).await,
+            Err(JoinError::FrameTooLarge)
+        ));
     }
 
     #[tokio::test]
@@ -982,7 +1022,7 @@ mod tests {
         let decision_task = tokio::spawn(async move {
             loop {
                 if let Some(pending) = deciding_coordinator.pending().unwrap() {
-                    let hints = BTreeMap::from([(inviter_id.to_string(), vec![inviter_hint])]);
+                    let hints = BTreeMap::from([(inviter_id.to_string(), inviter_hint)]);
                     deciding_coordinator
                         .decide(
                             &pending.request_id,
@@ -1018,7 +1058,7 @@ mod tests {
             state.selected_roster_chain().unwrap(),
             vec![genesis, admission]
         );
-        assert_eq!(state.peer_hints(authenticated_inviter).unwrap().len(), 1);
+        assert!(state.peer_hint(authenticated_inviter).unwrap().is_some());
         joiner_endpoint.close().await;
         inviter_endpoint.close().await;
     }
@@ -1061,7 +1101,6 @@ mod tests {
         write_json(
             &mut send,
             &JoinRequest {
-                protocol: "skillsync/1".to_owned(),
                 nonce: [7; 32],
                 device_name: "joiner".to_owned(),
                 endpoint_addr_json: serde_json::to_string(&joiner_endpoint.addr()).unwrap(),
@@ -1086,10 +1125,7 @@ mod tests {
                 &pending.request_id,
                 JoinDecision::approved(
                     vec![genesis, admission],
-                    BTreeMap::from([(
-                        inviter_identity.endpoint_id().to_string(),
-                        vec![inviter_hint],
-                    )]),
+                    BTreeMap::from([(inviter_identity.endpoint_id().to_string(), inviter_hint)]),
                 )
                 .unwrap(),
             )
@@ -1168,7 +1204,6 @@ mod tests {
         write_json(
             &mut send,
             &JoinRequest {
-                protocol: "skillsync/1".to_owned(),
                 nonce: [7; 32],
                 device_name: "joiner".to_owned(),
                 endpoint_addr_json: serde_json::to_string(&joiner_endpoint.addr()).unwrap(),
@@ -1222,7 +1257,7 @@ mod tests {
         .unwrap();
         let roster = vec![genesis.clone(), admission.clone()];
         let inviter_hint = serde_json::to_string(&inviter_endpoint.addr()).unwrap();
-        let hints = BTreeMap::from([(inviter_id.to_string(), vec![inviter_hint.clone()])]);
+        let hints = BTreeMap::from([(inviter_id.to_string(), inviter_hint.clone())]);
 
         coordinator
             .activate(SecretNonce::new([7; 32]), Duration::from_secs(60))
@@ -1242,7 +1277,6 @@ mod tests {
         write_json(
             &mut send,
             &JoinRequest {
-                protocol: "skillsync/1".to_owned(),
                 nonce: [7; 32],
                 device_name: "joiner".to_owned(),
                 endpoint_addr_json: serde_json::to_string(&joiner_endpoint.addr()).unwrap(),
@@ -1276,7 +1310,7 @@ mod tests {
                     &roster,
                     joiner_identity.endpoint_id(),
                     "joiner",
-                    &[(inviter_id, vec![inviter_hint.clone()])],
+                    &[(inviter_id, inviter_hint.clone())],
                 )
                 .unwrap();
             connection.close(0_u32.into(), b"after response before ack");

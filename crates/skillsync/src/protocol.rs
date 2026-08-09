@@ -5,12 +5,10 @@ use std::time::Duration;
 use iroh::endpoint::{RecvStream, SendStream};
 use thiserror::Error;
 
-use crate::identity::GroupId;
 use crate::record::{Manifest, Record, RecordError};
 use crate::roster::{RosterError, RosterRevision};
 
 pub const ALPN: &[u8] = b"skillsync/1";
-pub const PROTOCOL_VERSION: u8 = 1;
 
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
@@ -29,8 +27,7 @@ pub const MAX_ENDPOINT_ADDRS: usize = 32;
 pub const MAX_CONNECTION_BYTES: u64 = 256 * 1024 * 1024;
 pub const IO_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-const MAGIC: &[u8; 4] = b"SSP1";
-const HEADER_BYTES: usize = 10;
+const HEADER_BYTES: usize = 5;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -66,31 +63,32 @@ impl FrameTag {
             Self::Requests => MAX_FRAME_BYTES,
             Self::File => 64 * 1024,
             Self::Done => 0,
-            Self::FileUnavailable => 8 * 1024,
+            Self::FileUnavailable => 0,
         }
+    }
+}
+
+pub(crate) fn expect_frame_tag(actual: FrameTag, expected: FrameTag) -> Result<(), ProtocolError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(ProtocolError::UnexpectedFrame)
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Hello {
-    pub group_id: GroupId,
-    pub device_name: String,
-    pub roster_hash: [u8; 32],
     pub collections: Vec<String>,
     pub endpoint_addr_json: String,
 }
 
 impl Hello {
     pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
-        validate_short_string(&self.device_name, MAX_COLLECTION_NAME_BYTES)?;
         validate_collections(&self.collections)?;
         if self.endpoint_addr_json.len() > MAX_ADDRESS_HINT_BYTES {
             return Err(ProtocolError::AddressHintTooLarge);
         }
         let mut writer = WireWriter::default();
-        writer.fixed(self.group_id.as_bytes());
-        writer.string(&self.device_name)?;
-        writer.fixed(&self.roster_hash);
         writer.count(self.collections.len())?;
         for collection in &self.collections {
             writer.string(collection)?;
@@ -101,9 +99,6 @@ impl Hello {
 
     pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
         let mut reader = WireReader::new(bytes);
-        let group_id = GroupId::from_bytes(reader.fixed()?);
-        let device_name = reader.string(MAX_COLLECTION_NAME_BYTES)?;
-        let roster_hash = reader.fixed()?;
         let count = reader.count(MAX_COLLECTIONS)?;
         let mut collections = Vec::with_capacity(count);
         for _ in 0..count {
@@ -113,9 +108,6 @@ impl Hello {
         let endpoint_addr_json = reader.string(MAX_ADDRESS_HINT_BYTES)?;
         reader.finish()?;
         Ok(Self {
-            group_id,
-            device_name,
-            roster_hash,
             collections,
             endpoint_addr_json,
         })
@@ -329,21 +321,6 @@ pub fn decode_file_header(bytes: &[u8]) -> Result<Record, ProtocolError> {
     }
 }
 
-pub fn encode_file_unavailable(request: &FileRequest) -> Result<Vec<u8>, ProtocolError> {
-    RequestBundle {
-        requests: vec![request.clone()],
-    }
-    .encode()
-}
-
-pub fn decode_file_unavailable(bytes: &[u8]) -> Result<FileRequest, ProtocolError> {
-    let mut requests = RequestBundle::decode(bytes)?.requests;
-    if requests.len() != 1 {
-        return Err(ProtocolError::UnexpectedFrame);
-    }
-    Ok(requests.remove(0))
-}
-
 fn validate_record(record: &Record, collection: &str) -> Result<(), ProtocolError> {
     validate_collection(collection)?;
     if record.collection() != collection {
@@ -395,68 +372,12 @@ fn validate_short_string(value: &str, limit: usize) -> Result<(), ProtocolError>
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReceiveState {
-    Hello,
-    Roster,
-    Manifests,
-    Requests,
-    Files { remaining: usize },
-    Done,
-    Finished,
-}
-
-impl ReceiveState {
-    pub fn accept(&mut self, tag: FrameTag) -> Result<(), ProtocolError> {
-        let valid = matches!(
-            (*self, tag),
-            (Self::Hello, FrameTag::Hello)
-                | (Self::Roster, FrameTag::Roster)
-                | (Self::Manifests, FrameTag::Manifests)
-                | (Self::Requests, FrameTag::Requests)
-                | (Self::Files { .. }, FrameTag::File)
-                | (Self::Files { .. }, FrameTag::FileUnavailable)
-                | (Self::Done, FrameTag::Done)
-        );
-        if !valid {
-            return Err(ProtocolError::UnexpectedFrame);
-        }
-        *self = match *self {
-            Self::Hello => Self::Roster,
-            Self::Roster => Self::Manifests,
-            Self::Manifests => Self::Requests,
-            Self::Requests => Self::Files { remaining: 0 },
-            Self::Files { remaining } if remaining > 1 => Self::Files {
-                remaining: remaining - 1,
-            },
-            Self::Files { .. } => Self::Done,
-            Self::Done => Self::Finished,
-            Self::Finished => return Err(ProtocolError::UnexpectedFrame),
-        };
-        Ok(())
-    }
-
-    pub fn expect_files(&mut self, count: usize) -> Result<(), ProtocolError> {
-        if count > MAX_TRANSFERS || !matches!(self, Self::Files { remaining: 0 }) {
-            return Err(ProtocolError::UnexpectedFrame);
-        }
-        *self = if count == 0 {
-            Self::Done
-        } else {
-            Self::Files { remaining: count }
-        };
-        Ok(())
-    }
-}
-
 pub fn encode_frame(tag: FrameTag, payload: &[u8]) -> Result<Vec<u8>, ProtocolError> {
     if payload.len() > tag.payload_limit() || payload.len() > MAX_FRAME_BYTES {
         return Err(ProtocolError::FrameLimit);
     }
     let length = u32::try_from(payload.len()).map_err(|_| ProtocolError::FrameLimit)?;
     let mut bytes = Vec::with_capacity(HEADER_BYTES + payload.len());
-    bytes.extend_from_slice(MAGIC);
-    bytes.push(PROTOCOL_VERSION);
     bytes.push(tag as u8);
     bytes.extend_from_slice(&length.to_be_bytes());
     bytes.extend_from_slice(payload);
@@ -519,17 +440,9 @@ pub fn add_received(received: &mut u64, amount: u64) -> Result<(), ProtocolError
 }
 
 fn decode_header(header: &[u8; HEADER_BYTES]) -> Result<(FrameTag, usize), ProtocolError> {
-    if &header[..4] != MAGIC {
-        return Err(ProtocolError::WrongMagic);
-    }
-    if header[4] != PROTOCOL_VERSION {
-        return Err(ProtocolError::WrongVersion);
-    }
-    let tag = FrameTag::from_byte(header[5])?;
-    let length = usize::try_from(u32::from_be_bytes(
-        header[6..10].try_into().expect("length"),
-    ))
-    .map_err(|_| ProtocolError::FrameLimit)?;
+    let tag = FrameTag::from_byte(header[0])?;
+    let length = usize::try_from(u32::from_be_bytes(header[1..5].try_into().expect("length")))
+        .map_err(|_| ProtocolError::FrameLimit)?;
     if length > MAX_FRAME_BYTES || length > tag.payload_limit() {
         return Err(ProtocolError::FrameLimit);
     }
@@ -638,10 +551,6 @@ pub enum ProtocolError {
     Truncated,
     #[error("protocol input has trailing bytes")]
     TrailingBytes,
-    #[error("protocol input has the wrong magic")]
-    WrongMagic,
-    #[error("protocol version is unsupported")]
-    WrongVersion,
     #[error("protocol frame type is unknown")]
     UnknownFrameType,
     #[error("protocol frame arrived out of order")]
@@ -704,6 +613,7 @@ mod tests {
 
     use crate::identity::DeviceIdentity;
     use crate::identity::EndpointId;
+    use crate::identity::GroupId;
     use crate::path::ProtocolPath;
 
     use super::*;
@@ -721,30 +631,30 @@ mod tests {
     }
 
     #[test]
-    fn frame_codec_rejects_truncation_version_type_and_limits_before_payload_read() {
+    fn frame_codec_rejects_truncation_type_and_limits_before_payload_read() {
         let valid = encode_frame(FrameTag::Hello, b"hello").unwrap();
         assert_eq!(
             decode_frame(&mut Cursor::new(&valid)).unwrap(),
             (FrameTag::Hello, b"hello".to_vec())
         );
         assert!(matches!(
-            decode_frame(&mut Cursor::new(&valid[..8])),
+            decode_frame(&mut Cursor::new(&valid[..3])),
             Err(ProtocolError::Truncated)
         ));
-        let mut wrong_version = valid.clone();
-        wrong_version[4] = 2;
+        let mut truncated_payload = valid.clone();
+        truncated_payload.pop();
         assert!(matches!(
-            decode_frame(&mut Cursor::new(wrong_version)),
-            Err(ProtocolError::WrongVersion)
+            decode_frame(&mut Cursor::new(truncated_payload)),
+            Err(ProtocolError::Truncated)
         ));
         let mut wrong_type = valid.clone();
-        wrong_type[5] = 99;
+        wrong_type[0] = 99;
         assert!(matches!(
             decode_frame(&mut Cursor::new(wrong_type)),
             Err(ProtocolError::UnknownFrameType)
         ));
         let mut oversized = valid;
-        oversized[6..10]
+        oversized[1..5]
             .copy_from_slice(&(u32::try_from(MAX_FRAME_BYTES).unwrap() + 1).to_be_bytes());
         assert!(matches!(
             decode_frame(&mut Cursor::new(oversized)),
@@ -753,22 +663,41 @@ mod tests {
     }
 
     #[test]
-    fn receive_state_rejects_wrong_order_and_exactly_counts_files() {
-        let mut state = ReceiveState::Hello;
+    fn payloadless_frames_reject_content() {
         assert!(matches!(
-            state.accept(FrameTag::Roster),
+            encode_frame(FrameTag::FileUnavailable, b"request identity"),
+            Err(ProtocolError::FrameLimit)
+        ));
+        let frame = encode_frame(FrameTag::FileUnavailable, &[]).unwrap();
+        assert_eq!(
+            decode_frame(&mut Cursor::new(frame)).unwrap(),
+            (FrameTag::FileUnavailable, Vec::new())
+        );
+    }
+
+    #[test]
+    fn expected_tag_rejects_frames_that_arrive_out_of_order() {
+        expect_frame_tag(FrameTag::Hello, FrameTag::Hello).unwrap();
+        assert!(matches!(
+            expect_frame_tag(FrameTag::Roster, FrameTag::Hello),
             Err(ProtocolError::UnexpectedFrame)
         ));
-        state.accept(FrameTag::Hello).unwrap();
-        state.accept(FrameTag::Roster).unwrap();
-        state.accept(FrameTag::Manifests).unwrap();
-        state.accept(FrameTag::Requests).unwrap();
-        state.expect_files(2).unwrap();
-        state.accept(FrameTag::File).unwrap();
-        assert!(matches!(state, ReceiveState::Files { remaining: 1 }));
-        state.accept(FrameTag::FileUnavailable).unwrap();
-        state.accept(FrameTag::Done).unwrap();
-        assert_eq!(state, ReceiveState::Finished);
+    }
+
+    #[test]
+    fn hello_round_trip_rejects_trailing_bytes() {
+        let hello = Hello {
+            collections: vec![".agents".to_owned(), ".codex".to_owned()],
+            endpoint_addr_json: "bounded address".to_owned(),
+        };
+        let encoded = hello.encode().unwrap();
+        assert_eq!(Hello::decode(&encoded).unwrap(), hello);
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(matches!(
+            Hello::decode(&trailing),
+            Err(ProtocolError::TrailingBytes)
+        ));
     }
 
     #[test]
@@ -815,26 +744,6 @@ mod tests {
             path: "skill/SKILL.md".to_owned(),
             record_hash: [1; 32],
         };
-        assert_eq!(
-            decode_file_unavailable(&encode_file_unavailable(&request).unwrap()).unwrap(),
-            request
-        );
-        let two_unavailable = RequestBundle {
-            requests: vec![
-                request.clone(),
-                FileRequest {
-                    collection: ".agents".to_owned(),
-                    path: "skill/other.md".to_owned(),
-                    record_hash: [2; 32],
-                },
-            ],
-        }
-        .encode()
-        .unwrap();
-        assert!(matches!(
-            decode_file_unavailable(&two_unavailable),
-            Err(ProtocolError::UnexpectedFrame)
-        ));
         assert!(matches!(
             RequestBundle {
                 requests: vec![request.clone(), request]

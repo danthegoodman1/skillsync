@@ -13,7 +13,7 @@ use skillsync::daemon::{ControlRequest, send_request};
 use skillsync::identity::DeviceIdentity;
 use skillsync::record::RecordKind;
 use skillsync::roster::{RosterChange, RosterMember, RosterRevision};
-use skillsync::setup::{load_identity, now_ns};
+use skillsync::setup::load_identity;
 use skillsync::state::{CollectionScanStatus, CollectionWatchStatus, OperationalEvent, StateStore};
 
 fn paths(root: &Path) -> PlatformPaths {
@@ -395,12 +395,9 @@ fn setup_daemon_watch_repair_and_local_cli_work_across_processes() {
     )
     .unwrap();
     state.insert_roster_revision(&admission).unwrap();
+    let unavailable_hint = serde_json::to_string(&unavailable_addr).unwrap();
     state
-        .replace_peer_hints(
-            unavailable_endpoint,
-            &[serde_json::to_string(&unavailable_addr).unwrap()],
-            now_ns(),
-        )
+        .replace_peer_hint(unavailable_endpoint, &unavailable_hint)
         .unwrap();
     drop(state);
 
