@@ -475,6 +475,49 @@ mod tests {
             }
         }
 
+        fn unresponsive(attempts: usize) -> Self {
+            Self::unresponsive_with_deadline(attempts, Duration::from_secs(2))
+        }
+
+        fn unresponsive_with_deadline(attempts: usize, accept_deadline: Duration) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let captured = requests.clone();
+            let thread = thread::spawn(move || {
+                let deadline = std::time::Instant::now() + accept_deadline;
+                for _ in 0..attempts {
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error)
+                                if error.kind() == std::io::ErrorKind::WouldBlock
+                                    && std::time::Instant::now() < deadline =>
+                            {
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+                            Err(error) => panic!("fixture accept failed: {error}"),
+                        }
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    let request = read_request(&mut stream);
+                    captured.lock().unwrap().push(request);
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut trailing = [0_u8; 1];
+                    assert_eq!(stream.read(&mut trailing).unwrap(), 0);
+                }
+            });
+            Self {
+                url,
+                requests,
+                thread: Some(thread),
+            }
+        }
+
         fn finish(mut self) -> Vec<Vec<u8>> {
             self.thread.take().unwrap().join().unwrap();
             self.requests.lock().unwrap().clone()
@@ -487,6 +530,16 @@ mod tests {
                 thread.join().unwrap();
             }
         }
+    }
+
+    fn finish_fixture_with_timeout(fixture: Fixture, timeout: Duration) -> Vec<Vec<u8>> {
+        let (finished, result) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = finished.send(fixture.finish());
+        });
+        result
+            .recv_timeout(timeout)
+            .expect("joining-service fixture did not stop before its deadline")
     }
 
     fn read_request(stream: &mut TcpStream) -> Vec<u8> {
@@ -725,21 +778,39 @@ mod tests {
         assert!(!rendered.contains("join_unavailable"));
         fixture.finish();
 
-        let fixture = Fixture::start(vec![
-            (Duration::from_millis(100), 200, Vec::new()),
-            (Duration::from_millis(100), 200, Vec::new()),
-        ]);
+        let fixture = Fixture::unresponsive(MAX_ATTEMPTS);
         let client = JoiningServiceClient::with_timeout(
             &fixture.url,
             std::iter::empty::<(&str, &str)>(),
             Duration::from_millis(20),
         )
         .unwrap();
-        assert!(matches!(
-            client.claim("opaque"),
-            Err(JoiningServiceError::Timeout)
-        ));
-        fixture.finish();
+        let result = client.claim("opaque");
+        assert!(
+            matches!(result, Err(JoiningServiceError::Timeout)),
+            "unexpected timeout result: {result:?}"
+        );
+        assert_eq!(
+            finish_fixture_with_timeout(fixture, Duration::from_secs(3)).len(),
+            MAX_ATTEMPTS
+        );
+    }
+
+    #[test]
+    fn unresponsive_fixture_finishes_when_attempts_are_missing() {
+        let fixture = Fixture::unresponsive_with_deadline(2, Duration::from_millis(20));
+        assert!(finish_fixture_with_timeout(fixture, Duration::from_secs(1)).is_empty());
+
+        let fixture = Fixture::unresponsive_with_deadline(2, Duration::from_millis(100));
+        let mut stream = TcpStream::connect(fixture.url.strip_prefix("http://").unwrap()).unwrap();
+        stream
+            .write_all(b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}")
+            .unwrap();
+        drop(stream);
+        assert_eq!(
+            finish_fixture_with_timeout(fixture, Duration::from_secs(1)).len(),
+            1
+        );
     }
 
     #[test]
