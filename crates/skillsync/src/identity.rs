@@ -156,12 +156,6 @@ impl fmt::Debug for DeviceIdentity {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum IdentityReference {
-    Keyring { account: String },
-    File { path: PathBuf },
-}
-
 pub struct IdentityStore {
     data_dir: PathBuf,
 }
@@ -173,7 +167,7 @@ impl IdentityStore {
         }
     }
 
-    pub fn load_or_create(&self) -> Result<(DeviceIdentity, IdentityReference), IdentityError> {
+    pub fn load_or_create(&self) -> Result<DeviceIdentity, IdentityError> {
         fs::create_dir_all(&self.data_dir)?;
         let reference_path = self.data_dir.join("identity.ref");
         if reference_path.exists() {
@@ -184,7 +178,7 @@ impl IdentityStore {
         if secret_path.exists() {
             let identity = identity_from_slice(&read_owner_only(&secret_path)?)?;
             write_owner_only(&reference_path, b"file\nidentity.key\n")?;
-            return Ok((identity, IdentityReference::File { path: secret_path }));
+            return Ok(identity);
         }
 
         let account = keyring_account(&self.data_dir);
@@ -193,7 +187,7 @@ impl IdentityStore {
                 Ok(secret) => {
                     let identity = identity_from_slice(&secret)?;
                     write_owner_only(&reference_path, format!("keyring\n{account}\n").as_bytes())?;
-                    return Ok((identity, IdentityReference::Keyring { account }));
+                    return Ok(identity);
                 }
                 Err(keyring::Error::NoEntry) => {
                     let identity = DeviceIdentity::generate()?;
@@ -202,7 +196,7 @@ impl IdentityStore {
                             &reference_path,
                             format!("keyring\n{account}\n").as_bytes(),
                         )?;
-                        return Ok((identity, IdentityReference::Keyring { account }));
+                        return Ok(identity);
                     }
                     return self.persist_file_identity(identity, reference_path, secret_path);
                 }
@@ -213,10 +207,7 @@ impl IdentityStore {
         self.persist_file_identity(DeviceIdentity::generate()?, reference_path, secret_path)
     }
 
-    fn load_referenced(
-        &self,
-        reference_path: &Path,
-    ) -> Result<(DeviceIdentity, IdentityReference), IdentityError> {
+    fn load_referenced(&self, reference_path: &Path) -> Result<DeviceIdentity, IdentityError> {
         let reference = fs::read_to_string(reference_path)?;
         let mut lines = reference.lines();
         match (lines.next(), lines.next(), lines.next()) {
@@ -227,12 +218,7 @@ impl IdentityStore {
                     .get_secret()
                     .map_err(|_| IdentityError::KeyringUnavailable)?;
                 let identity = identity_from_slice(&secret)?;
-                Ok((
-                    identity,
-                    IdentityReference::Keyring {
-                        account: account.to_owned(),
-                    },
-                ))
+                Ok(identity)
             }
             (Some("file"), Some(relative), None) => {
                 let relative = Path::new(relative);
@@ -241,10 +227,7 @@ impl IdentityStore {
                 }
                 let path = self.data_dir.join(relative);
                 let secret = read_owner_only(&path)?;
-                Ok((
-                    identity_from_slice(&secret)?,
-                    IdentityReference::File { path },
-                ))
+                identity_from_slice(&secret)
             }
             _ => Err(IdentityError::InvalidReference),
         }
@@ -255,10 +238,10 @@ impl IdentityStore {
         identity: DeviceIdentity,
         reference_path: PathBuf,
         secret_path: PathBuf,
-    ) -> Result<(DeviceIdentity, IdentityReference), IdentityError> {
+    ) -> Result<DeviceIdentity, IdentityError> {
         write_owner_only(&secret_path, &identity.secret_bytes())?;
         write_owner_only(&reference_path, b"file\nidentity.key\n")?;
-        Ok((identity, IdentityReference::File { path: secret_path }))
+        Ok(identity)
     }
 }
 
@@ -371,9 +354,8 @@ mod tests {
         )
         .unwrap();
 
-        let (reopened, reference) = IdentityStore::new(&paths).load_or_create().unwrap();
+        let reopened = IdentityStore::new(&paths).load_or_create().unwrap();
         assert_eq!(reopened.endpoint_id(), identity.endpoint_id());
-        assert!(matches!(reference, IdentityReference::File { .. }));
         assert_eq!(
             fs::metadata(paths.data_dir.join("identity.key"))
                 .unwrap()
@@ -396,5 +378,21 @@ mod tests {
 
         let error = IdentityStore::new(&paths).load_or_create().unwrap_err();
         assert!(matches!(error, IdentityError::UnsafePermissions));
+    }
+
+    #[test]
+    fn invalid_reference_fails_without_replacing_the_identity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = test_paths(temporary.path());
+        fs::create_dir_all(&paths.data_dir).unwrap();
+        fs::write(
+            paths.data_dir.join("identity.ref"),
+            "file\n../identity.key\n",
+        )
+        .unwrap();
+
+        let error = IdentityStore::new(&paths).load_or_create().unwrap_err();
+        assert!(matches!(error, IdentityError::InvalidReference));
+        assert!(!paths.data_dir.join("identity.key").exists());
     }
 }

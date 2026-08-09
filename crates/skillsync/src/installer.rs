@@ -557,7 +557,6 @@ mod tests {
         let records = state.record_states(".agents").unwrap();
         assert_eq!(records.len(), 1);
         assert!(!records[0].materialized);
-        assert!(records[0].needs_repair);
         assert_eq!(state.local_counts().unwrap(), (0, 1));
         drop(state);
 
@@ -574,7 +573,6 @@ mod tests {
         let records = restarted.record_states(".agents").unwrap();
         assert_eq!(records.len(), 1);
         assert!(!records[0].materialized);
-        assert!(records[0].needs_repair);
         assert_eq!(restarted.local_counts().unwrap(), (0, 1));
     }
 
@@ -632,7 +630,6 @@ mod tests {
         assert!(!root.join("missing").exists());
         let missing_state = state.record_states(".agents").unwrap().remove(0);
         assert!(missing_state.materialized);
-        assert!(!missing_state.needs_repair);
 
         symlink(&outside, root.join("linked")).unwrap();
         let linked = Record::tombstone(
@@ -657,7 +654,6 @@ mod tests {
             .find(|item| item.record == linked)
             .unwrap();
         assert!(!linked_state.materialized);
-        assert!(linked_state.needs_repair);
     }
 
     #[test]
@@ -990,7 +986,6 @@ mod tests {
         let records = restarted.record_states(".agents").unwrap();
         assert_eq!(records.len(), 1);
         assert!(records[0].materialized);
-        assert!(!records[0].needs_repair);
         assert_eq!(restarted.local_counts().unwrap(), (1, 0));
     }
 

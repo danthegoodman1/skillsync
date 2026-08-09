@@ -69,8 +69,8 @@ Scope:
   signatures.
 - Implement last-write-wins comparison, canonical record hashing, roster
   revision validation and selection, and local path validation.
-- Add transactional SQLite migrations and queries for identity references,
-  roster revisions, collections, path records, peer hints, and bounded logs.
+- Create and validate the version-one SQLite schema for roster revisions,
+  collections, path records, peer hints, and bounded logs.
 
 Out of scope:
 
@@ -78,9 +78,10 @@ Out of scope:
   registration.
 
 Completion gate:
-The native workspace builds on macOS and Linux. Fresh and migrated databases
-reopen without changing state, and every deterministic rule produces the same
-result under input reordering.
+The native workspace builds on macOS and Linux. Fresh databases initialize and
+reopen without changing state. Databases whose application ID, tables, or
+columns do not match the version-one schema fail closed. Every deterministic
+rule produces the same result under input reordering.
 
 Testing plan:
 
@@ -90,8 +91,8 @@ Testing plan:
   rejection, and signature validation.
 - Path tests for traversal, invalid UTF-8, symlink-safe relative paths, and
   case-collision detection using platform-specific fixtures.
-- SQLite tests for migrations, transaction rollback, restart, and uniqueness
-  constraints.
+- SQLite tests for transactional schema creation, exact schema validation,
+  transaction rollback, restart, and uniqueness constraints.
 
 Status ledger:
 
@@ -101,7 +102,7 @@ Status ledger:
 | Complete | Work | P1.2: Implement configuration, platform paths, and persistent identities | `config.rs` and `identity.rs`, including redaction, permission, and restart tests. |
 | Complete | Work | P1.3: Implement canonical records and deterministic LWW comparison | `canonical.rs` and `record.rs`, including total-order and permutation-independent manifest tests. |
 | Complete | Work | P1.4: Implement signed roster revision validation and branch selection | `roster.rs` and `state.rs`, including signature, stale-parent, removal-priority, insertion-order, and reopen tests. |
-| Complete | Work | P1.5: Implement SQLite schema and transactional access | `state.rs` migration, rollback, winner, roster reconstruction, log retention, and reopen tests. |
+| Complete | Work | P1.5: Implement SQLite schema and transactional access | `state.rs` schema initialization, exact-shape validation, rollback, winner, roster reconstruction, log retention, and reopen tests. |
 | Complete | Test | Phase 1 deterministic and persistence test plan | `cargo test --workspace --locked` passes 34 tests and strict Clippy passes. |
 | Complete | Gate | Phase 1 completion gate | Local gates pass and [CI run 31274704319](https://github.com/danthegoodman1/skillsync/actions/runs/31274704319) passes Ubuntu and macOS jobs. |
 

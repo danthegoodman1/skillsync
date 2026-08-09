@@ -1107,7 +1107,7 @@ mod tests {
             .unwrap()
         );
         let record = state.record_states(".agents").unwrap().remove(0);
-        assert!(record.needs_repair);
+        assert!(!record.materialized);
         assert!(
             state
                 .logs()

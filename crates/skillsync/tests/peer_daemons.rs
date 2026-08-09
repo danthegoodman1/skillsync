@@ -278,8 +278,8 @@ interval = "1h"
 }
 
 fn initialize_group(first: &DeviceFixture, second: &DeviceFixture) {
-    let (first_identity, _) = IdentityStore::new(&first.paths).load_or_create().unwrap();
-    let (second_identity, _) = IdentityStore::new(&second.paths).load_or_create().unwrap();
+    let first_identity = IdentityStore::new(&first.paths).load_or_create().unwrap();
+    let second_identity = IdentityStore::new(&second.paths).load_or_create().unwrap();
     let genesis =
         RosterRevision::genesis(GroupId::from_bytes([91; 32]), "first", &first_identity).unwrap();
     let admission = RosterRevision::child(
@@ -624,7 +624,7 @@ fn third_device_joins_one_member_learns_every_peer_syncs_and_is_refused_after_re
         Duration::from_secs(15),
     );
 
-    let third_identity = IdentityStore::new(&third.paths).load_or_create().unwrap().0;
+    let third_identity = IdentityStore::new(&third.paths).load_or_create().unwrap();
     let third_endpoint = third_identity.endpoint_id();
     let mut join = third.command();
     join.arg("join")
@@ -671,7 +671,6 @@ fn third_device_joins_one_member_learns_every_peer_syncs_and_is_refused_after_re
     let second_endpoint = IdentityStore::new(&second.paths)
         .load_or_create()
         .unwrap()
-        .0
         .endpoint_id();
     assert!(third_state.peer_hint(second_endpoint).unwrap().is_some());
     drop(third_state);

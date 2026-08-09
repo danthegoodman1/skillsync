@@ -170,13 +170,13 @@ impl NetworkHandle {
 
     pub fn decide_join(&self, request_id: &str, approve: bool) -> Result<(), NetworkError> {
         if !approve {
-            self.joins.decide(request_id, JoinDecision::rejected())?;
+            self.joins.decide(request_id, JoinDecision::Rejected)?;
             return Ok(());
         }
         let decision = match self.build_join_approval(request_id) {
             Ok(decision) => decision,
             Err(error) => {
-                let _ = self.joins.decide(request_id, JoinDecision::rejected());
+                let _ = self.joins.decide(request_id, JoinDecision::Rejected);
                 return Err(error);
             }
         };
@@ -1014,7 +1014,7 @@ mod tests {
             runtime_dir: temporary.path().join("run"),
         };
         fs::create_dir_all(&paths.data_dir).unwrap();
-        let (local, _) = crate::identity::IdentityStore::new(&paths)
+        let local = crate::identity::IdentityStore::new(&paths)
             .load_or_create()
             .unwrap();
         let joiner = DeviceIdentity::from_secret([73; 32]);
@@ -1892,7 +1892,7 @@ mod tests {
             .into_iter()
             .find(|record| record.record.path().as_str() == "a-blocked/SKILL.md")
             .unwrap();
-        assert!(!blocked.materialized && blocked.needs_repair);
+        assert!(!blocked.materialized);
         assert!(state.logs().unwrap().iter().any(|log| matches!(
             &log.event,
             OperationalEvent::FileApplyRejected { path, .. }
@@ -2009,7 +2009,7 @@ mod tests {
                 .into_iter()
                 .find(|record| record.record.path().as_str() == "a-unavailable/SKILL.md")
                 .unwrap();
-            assert!(!missing.materialized && missing.needs_repair);
+            assert!(!missing.materialized);
             assert!(state.logs().unwrap().iter().any(|log| matches!(
                 &log.event,
                 OperationalEvent::TransferRejected { path, .. }
@@ -2104,7 +2104,7 @@ mod tests {
             .into_iter()
             .find(|record| record.record.path().as_str() == "a-root-missing/SKILL.md")
             .unwrap();
-        assert!(!missing.materialized && missing.needs_repair);
+        assert!(!missing.materialized);
         assert!(state.logs().unwrap().iter().any(|log| matches!(
             &log.event,
             OperationalEvent::FileApplyRejected { path, .. }

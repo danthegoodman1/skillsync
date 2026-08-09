@@ -1149,7 +1149,6 @@ impl CollectionWatchStatus {
 pub struct PathRecordState {
     pub record: Record,
     pub materialized: bool,
-    pub needs_repair: bool,
     pub materialized_fingerprint: Option<FileFingerprint>,
 }
 
@@ -1533,7 +1532,6 @@ fn decode_path_record_state(
     Ok(PathRecordState {
         record: decode_indexed_record((hash, canonical), collection, &path)?,
         materialized,
-        needs_repair: !materialized,
         materialized_fingerprint: decode_materialized_fingerprint(
             materialized_modified_ns,
             materialized_size,
@@ -2340,14 +2338,12 @@ mod tests {
             .find(|state| state.record.path() == first.path())
             .unwrap();
         assert!(installed.materialized);
-        assert!(!installed.needs_repair);
         assert_eq!(installed.materialized_fingerprint, Some(first_fingerprint));
         let detached = states
             .iter()
             .find(|state| state.record.path() == second.path())
             .unwrap();
         assert!(!detached.materialized);
-        assert!(detached.needs_repair);
         assert_eq!(detached.materialized_fingerprint, None);
     }
 

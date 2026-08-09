@@ -28,7 +28,7 @@ pub fn setup(paths: &PlatformPaths, config: &Config) -> Result<SetupResult, Setu
     fs::create_dir_all(&paths.data_dir)?;
     fs::create_dir_all(&paths.runtime_dir)?;
 
-    let (identity, _) = IdentityStore::new(paths).load_or_create()?;
+    let identity = IdentityStore::new(paths).load_or_create()?;
     let database = paths.data_dir.join("state.sqlite3");
     let mut state = StateStore::open(&database)?;
     let created = state.selected_roster_chain()?.is_empty();
@@ -61,7 +61,7 @@ pub fn setup_joining_device(
     config.validate()?;
     fs::create_dir_all(&paths.data_dir)?;
     fs::create_dir_all(&paths.runtime_dir)?;
-    let (identity, _) = IdentityStore::new(paths).load_or_create()?;
+    let identity = IdentityStore::new(paths).load_or_create()?;
     let database = paths.data_dir.join("state.sqlite3");
     let mut state = StateStore::open(&database)?;
     let existing_roster = state.selected_roster_chain()?;
@@ -112,8 +112,7 @@ fn attach_default_collections(
 }
 
 pub fn load_identity(paths: &PlatformPaths) -> Result<DeviceIdentity, SetupError> {
-    let (identity, _) = IdentityStore::new(paths).load_or_create()?;
-    Ok(identity)
+    Ok(IdentityStore::new(paths).load_or_create()?)
 }
 
 pub fn load_identity_from_data_dir(data_dir: &Path) -> Result<DeviceIdentity, SetupError> {

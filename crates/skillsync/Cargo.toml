@@ -22,7 +22,7 @@ iroh-tickets = "1.0.0"
 keyring = "4.1.6"
 notify = { version = "8.2.0", default-features = false, features = ["macos_kqueue"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls"] }
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["bundled"], default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tempfile = "3.27.0"
@@ -32,7 +32,7 @@ tokio = { version = "1.47.1", default-features = false, features = ["rt-multi-th
 toml = "1.1.4"
 unicode-normalization = "0.1.25"
 url = "2.5.8"
-uuid = { version = "1.24.0", features = ["v4", "serde"] }
+uuid = { version = "1.24.0", features = ["v4"] }
 
 [dev-dependencies]
 iroh = { version = "1.0.3", features = ["portmapper", "test-utils", "tls-ring"], default-features = false }

@@ -368,7 +368,6 @@ and membership. A peer's EndpointAddr bundle is a replaceable observation.
 
 SQLite stores only the state needed to restart safely:
 
-- the device name and references to protected identity keys
 - group identity and signed roster revisions
 - configured collection names, paths, and resolved roots
 - the winning record for each known path, including tombstones, and the
@@ -379,9 +378,11 @@ SQLite stores only the state needed to restart safely:
 Skill contents live in configured collection directories and temporary transfer
 files. SQLite stores metadata alongside those canonical contents.
 
-Identity private keys and active invitation nonces use operating-system secret
-storage when available and owner-only files otherwise. SQLite migrations are
-transactional.
+Identity private keys use operating-system secret storage when available and
+an owner-only file otherwise. `identity.ref` records which backend holds the
+key. Active invitation nonces live in daemon memory until they are used,
+rejected, or expire. The SQLite version-one schema is created transactionally,
+and existing databases must match its application ID, tables, and columns.
 
 ## Failure behavior
 

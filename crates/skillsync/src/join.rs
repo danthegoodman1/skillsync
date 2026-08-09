@@ -90,29 +90,22 @@ struct PendingJoin {
     deadline: Instant,
 }
 
-pub struct JoinDecision {
-    approved: bool,
-    roster: String,
-    peer_hints: BTreeMap<String, String>,
+pub(crate) enum JoinDecision {
+    Rejected,
+    Approved {
+        roster: String,
+        peer_hints: BTreeMap<String, String>,
+    },
 }
 
 impl JoinDecision {
-    pub fn rejected() -> Self {
-        Self {
-            approved: false,
-            roster: String::new(),
-            peer_hints: BTreeMap::new(),
-        }
-    }
-
-    pub fn approved(
+    pub(crate) fn approved(
         roster: Vec<RosterRevision>,
         peer_hints: BTreeMap<String, String>,
     ) -> Result<Self, JoinError> {
         let encoded_roster = encode_roster(&roster)?;
         validate_approval_payload(&roster, &encoded_roster, &peer_hints)?;
-        Ok(Self {
-            approved: true,
+        Ok(Self::Approved {
             roster: encoded_roster,
             peer_hints,
         })
@@ -157,7 +150,7 @@ impl JoinCoordinator {
         Ok((pending.info.clone(), pending.endpoint_addr_json.clone()))
     }
 
-    pub fn decide(&self, request_id: &str, decision: JoinDecision) -> Result<(), JoinError> {
+    pub(crate) fn decide(&self, request_id: &str, decision: JoinDecision) -> Result<(), JoinError> {
         let mut state = self.inner.lock().map_err(|_| JoinError::Coordinator)?;
         expire_locked(&mut state);
         let JoinState::Pending(pending) = &*state else {
@@ -389,18 +382,17 @@ pub async fn run_inviter(
             return Err(JoinError::JoinerGone);
         }
     };
-    let response = if decision.approved {
-        JoinResponse {
+    let response = match decision {
+        JoinDecision::Approved { roster, peer_hints } => JoinResponse {
             approved: true,
-            roster: decision.roster,
-            peer_hints: decision.peer_hints,
-        }
-    } else {
-        JoinResponse {
+            roster,
+            peer_hints,
+        },
+        JoinDecision::Rejected => JoinResponse {
             approved: false,
             roster: String::new(),
             peer_hints: BTreeMap::new(),
-        }
+        },
     };
     write_json(&mut send, &response, JOIN_RESPONSE_LIMIT).await?;
     if !response.approved {
@@ -801,7 +793,7 @@ mod tests {
             .activate(SecretNonce::new([7; 32]), Duration::from_secs(60))
             .unwrap();
         assert!(matches!(
-            coordinator.decide("stale", JoinDecision::rejected()),
+            coordinator.decide("stale", JoinDecision::Rejected),
             Err(JoinError::UnknownJoinRequest)
         ));
         let joiner = identity(2);
@@ -835,9 +827,9 @@ mod tests {
             Err(JoinError::InvitationUnavailable)
         ));
         coordinator
-            .decide(&request_id, JoinDecision::rejected())
+            .decide(&request_id, JoinDecision::Rejected)
             .unwrap();
-        assert!(!decision.await.unwrap().approved);
+        assert!(matches!(decision.await.unwrap(), JoinDecision::Rejected));
         assert!(coordinator.pending().unwrap().is_none());
     }
 

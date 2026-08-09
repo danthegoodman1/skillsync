@@ -411,27 +411,24 @@ fn merge_remote_manifests(
             let winner = state.record(collection, candidate.path().as_str())?;
             if winner.as_ref() == Some(candidate)
                 && matches!(candidate.kind(), RecordKind::Tombstone)
-            {
-                let needs_repair = state
+                && state
                     .record_state(collection, candidate.path().as_str())?
-                    .is_some_and(|item| item.needs_repair);
-                if needs_repair
-                    && let Err(_error) = materialize_tombstone(
-                        &mut state,
-                        &local_collection.local_path,
-                        candidate,
-                        config.max_logs,
-                    )
-                {
-                    state.append_log(
-                        now_ns(),
-                        &OperationalEvent::RepairRequired {
-                            collection: collection.clone(),
-                            path: candidate.path().clone(),
-                        },
-                        config.max_logs,
-                    )?;
-                }
+                    .is_some_and(|item| !item.materialized)
+                && let Err(_error) = materialize_tombstone(
+                    &mut state,
+                    &local_collection.local_path,
+                    candidate,
+                    config.max_logs,
+                )
+            {
+                state.append_log(
+                    now_ns(),
+                    &OperationalEvent::RepairRequired {
+                        collection: collection.clone(),
+                        path: candidate.path().clone(),
+                    },
+                    config.max_logs,
+                )?;
             }
         }
     }
@@ -452,7 +449,7 @@ fn merge_remote_manifests(
             };
             if winner.record == *remote
                 && matches!(remote.kind(), RecordKind::File { .. })
-                && (!winner.materialized || winner.needs_repair)
+                && !winner.materialized
             {
                 requests.push(FileRequest {
                     collection: collection.clone(),
@@ -558,7 +555,7 @@ fn prepare_requested_file(
         log_unavailable_in(&mut state, config, remote_endpoint, request, false)?;
         return Ok(None);
     };
-    if !record_state.materialized || record_state.needs_repair {
+    if !record_state.materialized {
         log_unavailable_in(&mut state, config, remote_endpoint, request, false)?;
         return Ok(None);
     }

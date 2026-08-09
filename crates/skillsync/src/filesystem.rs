@@ -896,7 +896,6 @@ mod tests {
         assert_eq!(store.local_counts().unwrap(), (0, 1));
         let state = &store.record_states(".agents").unwrap()[0];
         assert!(!state.materialized);
-        assert!(state.needs_repair);
         assert_eq!(state.materialized_fingerprint, None);
         assert!(store.logs().unwrap().iter().any(|log| matches!(
             &log.event,
