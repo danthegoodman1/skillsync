@@ -308,8 +308,9 @@ fn apply_file_fixture_with_hook(
         }
         Err(error @ InstallError::UnstableRoot) => Err(error),
         Err(error) => {
-            state.set_repair_required(record.collection(), record.path().as_str(), true)?;
-            state.append_log(
+            state.mark_repair_required_and_log(
+                record.collection(),
+                record.path().as_str(),
                 now_ns(),
                 &OperationalEvent::FileApplyRejected {
                     collection: record.collection().to_owned(),
@@ -1242,5 +1243,32 @@ mod tests {
                 .iter()
                 .any(|log| matches!(log.event, OperationalEvent::FileApplyRejected { .. }))
         );
+    }
+
+    #[test]
+    fn failed_install_rolls_back_repair_when_its_log_fails() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut state = StateStore::open_in_memory().unwrap();
+        state
+            .add_collection(".agents", temporary.path(), None)
+            .unwrap();
+        let winner = record(b"expected", 10);
+        state.merge_record(&winner, 10, None, 100).unwrap();
+        let records_before = state.record_states(".agents").unwrap();
+        let logs_before = state.logs().unwrap();
+        state.reject_future_log_inserts().unwrap();
+
+        assert!(matches!(
+            apply_file_fixture(
+                &mut state,
+                temporary.path(),
+                &winner,
+                &mut Cursor::new(b"corrupt!"),
+                100,
+            ),
+            Err(InstallError::State(_))
+        ));
+        assert_eq!(state.record_states(".agents").unwrap(), records_before);
+        assert_eq!(state.logs().unwrap(), logs_before);
     }
 }

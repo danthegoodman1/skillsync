@@ -28,11 +28,9 @@ pub fn setup(paths: &PlatformPaths, config: &Config) -> Result<SetupResult, Setu
     fs::create_dir_all(&paths.data_dir)?;
     fs::create_dir_all(&paths.runtime_dir)?;
 
-    let (identity, reference) = IdentityStore::new(paths).load_or_create()?;
+    let (identity, _) = IdentityStore::new(paths).load_or_create()?;
     let database = paths.data_dir.join("state.sqlite3");
     let mut state = StateStore::open(&database)?;
-    state.save_identity_reference("device", &reference)?;
-
     let created = state.selected_roster_chain()?.is_empty();
     if created {
         let genesis =
@@ -63,7 +61,7 @@ pub fn setup_joining_device(
     config.validate()?;
     fs::create_dir_all(&paths.data_dir)?;
     fs::create_dir_all(&paths.runtime_dir)?;
-    let (identity, reference) = IdentityStore::new(paths).load_or_create()?;
+    let (identity, _) = IdentityStore::new(paths).load_or_create()?;
     let database = paths.data_dir.join("state.sqlite3");
     let mut state = StateStore::open(&database)?;
     let existing_roster = state.selected_roster_chain()?;
@@ -74,7 +72,6 @@ pub fn setup_joining_device(
     if !existing_roster.is_empty() && existing_name.is_none() {
         return Err(SetupError::LocalDeviceRemoved);
     }
-    state.save_identity_reference("device", &reference)?;
     let collections = attach_default_collections(&mut state, config)?;
     Ok(SetupResult {
         device_name: existing_name

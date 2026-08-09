@@ -1521,7 +1521,7 @@ mod tests {
         fs::write(second_dir.join("skills/review/SKILL.md"), b"bad").unwrap();
         StateStore::open(&second_config.database)
             .unwrap()
-            .set_repair_required(".agents", "review/SKILL.md", true)
+            .set_repair_required(".agents", "review/SKILL.md")
             .unwrap();
         connect_once(
             &second_endpoint,

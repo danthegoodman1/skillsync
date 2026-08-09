@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use ed25519_dalek::{Signer, SigningKey};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 use crate::config::PlatformPaths;
@@ -55,6 +56,25 @@ impl FromStr for EndpointId {
                 | hex_nibble(value.as_bytes()[offset + 1])?;
         }
         Ok(Self(bytes))
+    }
+}
+
+impl Serialize for EndpointId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for EndpointId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
     }
 }
 

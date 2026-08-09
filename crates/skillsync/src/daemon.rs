@@ -929,16 +929,13 @@ fn log_value(log: &OperationalLog) -> Value {
             object.insert("path".to_owned(), json!(path.as_str()));
             object.insert("peer_endpoint".to_owned(), json!(peer_endpoint.to_string()));
         }
-        OperationalEvent::StateOpened
-        | OperationalEvent::DaemonStarted
-        | OperationalEvent::DaemonStopped => {}
+        OperationalEvent::DaemonStarted | OperationalEvent::DaemonStopped => {}
     }
     value
 }
 
 fn event_name(event: &OperationalEvent) -> &'static str {
     match event {
-        OperationalEvent::StateOpened => "state_opened",
         OperationalEvent::DaemonStarted => "daemon_started",
         OperationalEvent::DaemonStopped => "daemon_stopped",
         OperationalEvent::CollectionAttached { .. } => "collection_attached",
@@ -1118,5 +1115,256 @@ mod tests {
                 .iter()
                 .any(|log| matches!(log.event, OperationalEvent::RepairRequired { .. }))
         );
+    }
+
+    #[test]
+    fn operational_event_cli_json_is_stable_and_flattened() {
+        let path = crate::path::ProtocolPath::parse("review/SKILL.md").unwrap();
+        let peer = EndpointId::from_bytes([7; 32]);
+        let candidate = EndpointId::from_bytes([8; 32]);
+        let winner = EndpointId::from_bytes([9; 32]);
+        assert_eq!(
+            serde_json::to_vec(&OperationalEvent::DaemonStarted).unwrap(),
+            br#"{"event":"daemon_started"}"#
+        );
+        let base = |level: &str, event: &str| json!({"id": 4, "created_ns": 5, "level": level, "event": event});
+        let with_collection = |level: &str, event: &str| {
+            json!({
+                "id": 4,
+                "created_ns": 5,
+                "level": level,
+                "event": event,
+                "collection": ".agents"
+            })
+        };
+        let with_path = |level: &str, event: &str| {
+            json!({
+                "id": 4,
+                "created_ns": 5,
+                "level": level,
+                "event": event,
+                "collection": ".agents",
+                "path": "review/SKILL.md"
+            })
+        };
+        let with_peer = |level: &str, event: &str| {
+            json!({
+                "id": 4,
+                "created_ns": 5,
+                "level": level,
+                "event": event,
+                "peer_endpoint": peer.to_string()
+            })
+        };
+        let cases = vec![
+            (
+                OperationalEvent::DaemonStarted,
+                base("info", "daemon_started"),
+            ),
+            (
+                OperationalEvent::DaemonStopped,
+                base("info", "daemon_stopped"),
+            ),
+            (
+                OperationalEvent::CollectionAttached {
+                    collection: ".agents".to_owned(),
+                },
+                with_collection("info", "collection_attached"),
+            ),
+            (
+                OperationalEvent::CollectionDetached {
+                    collection: ".agents".to_owned(),
+                },
+                with_collection("info", "collection_detached"),
+            ),
+            (
+                OperationalEvent::CollectionPaused {
+                    collection: ".agents".to_owned(),
+                },
+                with_collection("warn", "collection_paused"),
+            ),
+            (
+                OperationalEvent::CollectionScanned {
+                    collection: ".agents".to_owned(),
+                },
+                with_collection("debug", "collection_scanned"),
+            ),
+            (
+                OperationalEvent::CollectionWarning {
+                    collection: ".agents".to_owned(),
+                    path: Some(path.clone()),
+                    issue: crate::state::CollectionIssue::SymlinkEscape,
+                },
+                with_path("warn", "symlink_escape"),
+            ),
+            (
+                OperationalEvent::CollectionWarning {
+                    collection: ".agents".to_owned(),
+                    path: Some(path.clone()),
+                    issue: crate::state::CollectionIssue::SymlinkCycle,
+                },
+                with_path("warn", "symlink_cycle"),
+            ),
+            (
+                OperationalEvent::CollectionWarning {
+                    collection: ".agents".to_owned(),
+                    path: None,
+                    issue: crate::state::CollectionIssue::PathRejected,
+                },
+                with_collection("warn", "path_rejected"),
+            ),
+            (
+                OperationalEvent::CollectionWarning {
+                    collection: ".agents".to_owned(),
+                    path: Some(path.clone()),
+                    issue: crate::state::CollectionIssue::TimestampRejected,
+                },
+                with_path("warn", "timestamp_rejected"),
+            ),
+            (
+                OperationalEvent::RecordAccepted {
+                    collection: ".agents".to_owned(),
+                    path: path.clone(),
+                    source_peer: Some(peer),
+                },
+                with_path("info", "record_accepted"),
+            ),
+            (
+                OperationalEvent::RecordRejected {
+                    collection: ".agents".to_owned(),
+                    path: path.clone(),
+                    source_peer: Some(peer),
+                    candidate_modified_ns: 6,
+                    candidate_author: candidate,
+                    winner_modified_ns: 7,
+                    winner_author: winner,
+                },
+                json!({
+                    "id": 4,
+                    "created_ns": 5,
+                    "level": "warn",
+                    "event": "record_rejected",
+                    "collection": ".agents",
+                    "path": "review/SKILL.md",
+                    "candidate_modified_ns": 6,
+                    "candidate_author": candidate.to_string(),
+                    "winner_modified_ns": 7,
+                    "winner_author": winner.to_string()
+                }),
+            ),
+            (
+                OperationalEvent::FileInstalled {
+                    collection: ".agents".to_owned(),
+                    path: path.clone(),
+                },
+                with_path("info", "file_installed"),
+            ),
+            (
+                OperationalEvent::FileApplyRejected {
+                    collection: ".agents".to_owned(),
+                    path: path.clone(),
+                },
+                with_path("warn", "file_apply_rejected"),
+            ),
+            (
+                OperationalEvent::RepairRequired {
+                    collection: ".agents".to_owned(),
+                    path: path.clone(),
+                },
+                with_path("warn", "repair_required"),
+            ),
+            (
+                OperationalEvent::PeerUnreachable {
+                    peer_endpoint: peer,
+                },
+                with_peer("warn", "peer_unreachable"),
+            ),
+            (
+                OperationalEvent::PeerAttempted {
+                    peer_endpoint: peer,
+                },
+                with_peer("info", "peer_attempted"),
+            ),
+            (
+                OperationalEvent::PeerSynchronized {
+                    peer_endpoint: peer,
+                },
+                with_peer("info", "peer_synchronized"),
+            ),
+            (
+                OperationalEvent::PeerRejected {
+                    peer_endpoint: peer,
+                },
+                with_peer("warn", "peer_rejected"),
+            ),
+            (
+                OperationalEvent::PeerSessionFailed {
+                    peer_endpoint: peer,
+                },
+                with_peer("warn", "peer_session_failed"),
+            ),
+            (
+                OperationalEvent::FileSent {
+                    collection: ".agents".to_owned(),
+                    path: path.clone(),
+                    peer_endpoint: peer,
+                },
+                json!({
+                    "id": 4,
+                    "created_ns": 5,
+                    "level": "info",
+                    "event": "file_sent",
+                    "collection": ".agents",
+                    "path": "review/SKILL.md",
+                    "peer_endpoint": peer.to_string()
+                }),
+            ),
+            (
+                OperationalEvent::FileReceived {
+                    collection: ".agents".to_owned(),
+                    path: path.clone(),
+                    peer_endpoint: peer,
+                },
+                json!({
+                    "id": 4,
+                    "created_ns": 5,
+                    "level": "info",
+                    "event": "file_received",
+                    "collection": ".agents",
+                    "path": "review/SKILL.md",
+                    "peer_endpoint": peer.to_string()
+                }),
+            ),
+            (
+                OperationalEvent::TransferRejected {
+                    collection: ".agents".to_owned(),
+                    path,
+                    peer_endpoint: peer,
+                },
+                json!({
+                    "id": 4,
+                    "created_ns": 5,
+                    "level": "warn",
+                    "event": "transfer_rejected",
+                    "collection": ".agents",
+                    "path": "review/SKILL.md",
+                    "peer_endpoint": peer.to_string()
+                }),
+            ),
+        ];
+
+        for (event, expected) in cases {
+            let payload = serde_json::to_vec(&event).unwrap();
+            let decoded: OperationalEvent = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(decoded, event);
+            assert_eq!(
+                log_value(&OperationalLog {
+                    id: 4,
+                    created_ns: 5,
+                    event: decoded,
+                }),
+                expected
+            );
+        }
     }
 }

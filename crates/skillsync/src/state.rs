@@ -5,17 +5,50 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::identity::{DeviceIdentity, EndpointId, IdentityReference};
+use crate::identity::{DeviceIdentity, EndpointId};
 use crate::path::{PathError, ProtocolPath};
 use crate::record::{Record, RecordError};
 use crate::roster::{RosterChange, RosterError, RosterHash, RosterRevision, select_chain};
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 1;
 const MAX_PEER_HINTS: usize = 32;
 const MAX_PEER_HINT_BYTES: usize = 16 * 1024;
 const MAX_ROSTER_RETRY_DEPTH: usize = 1_024;
+const MAX_OPERATIONAL_EVENT_BYTES: usize = 16 * 1024;
+const SCHEMA_APPLICATION_ID: i64 = 1_397_445_465;
+const SCHEMA_TABLES: [(&str, &[&str]); 6] = [
+    (
+        "collections",
+        &[
+            "name",
+            "local_path",
+            "resolved_root",
+            "scan_status",
+            "watch_status",
+        ],
+    ),
+    ("operational_logs", &["id", "created_ns", "payload"]),
+    (
+        "path_records",
+        &[
+            "collection",
+            "path",
+            "record_hash",
+            "kind",
+            "canonical",
+            "materialized",
+            "materialized_modified_ns",
+            "materialized_size",
+            "materialized_hash",
+        ],
+    ),
+    ("peer_health", &["endpoint_id", "reachable"]),
+    ("peer_hints", &["endpoint_id", "hint", "updated_ns"]),
+    ("roster_revisions", &["hash", "canonical"]),
+];
 
 pub struct StateStore {
     connection: Connection,
@@ -46,47 +79,6 @@ impl StateStore {
         Ok(self
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))?)
-    }
-
-    pub fn save_identity_reference(
-        &self,
-        slot: &str,
-        reference: &IdentityReference,
-    ) -> Result<(), StateError> {
-        let (backend, locator): (&str, Vec<u8>) = match reference {
-            IdentityReference::Keyring { account } => ("keyring", account.as_bytes().to_vec()),
-            IdentityReference::File { path } => ("file", path.as_os_str().as_bytes().to_vec()),
-        };
-        self.connection.execute(
-            "INSERT INTO identity_refs (slot, backend, locator)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(slot) DO UPDATE SET backend = excluded.backend, locator = excluded.locator",
-            params![slot, backend, locator],
-        )?;
-        Ok(())
-    }
-
-    pub fn identity_reference(&self, slot: &str) -> Result<Option<IdentityReference>, StateError> {
-        let row = self
-            .connection
-            .query_row(
-                "SELECT backend, locator FROM identity_refs WHERE slot = ?1",
-                [slot],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
-            )
-            .optional()?;
-        row.map(|(backend, locator)| match backend.as_str() {
-            "keyring" => String::from_utf8(locator)
-                .map(|account| IdentityReference::Keyring { account })
-                .map_err(|_| StateError::InvalidStoredState("keyring account is not UTF-8")),
-            "file" => Ok(IdentityReference::File {
-                path: PathBuf::from(OsString::from_vec(locator)),
-            }),
-            _ => Err(StateError::InvalidStoredState(
-                "unknown identity reference backend",
-            )),
-        })
-        .transpose()
     }
 
     pub fn add_collection(
@@ -126,7 +118,6 @@ impl StateStore {
         transaction.execute(
             "UPDATE path_records SET
                 materialized = 0,
-                needs_repair = 1,
                 materialized_modified_ns = NULL,
                 materialized_size = NULL,
                 materialized_hash = NULL
@@ -168,7 +159,6 @@ impl StateStore {
             transaction.execute(
                 "UPDATE path_records SET
                     materialized = 0,
-                    needs_repair = 1,
                     materialized_modified_ns = NULL,
                     materialized_size = NULL,
                     materialized_hash = NULL
@@ -276,15 +266,8 @@ impl StateStore {
         }
         let hash = revision.canonical_hash();
         transaction.execute(
-            "INSERT INTO roster_revisions
-                (hash, revision_number, parent_hash, canonical)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                hash.as_bytes(),
-                i64::try_from(revision.number()).map_err(|_| StateError::NumberOverflow)?,
-                revision.parent_hash().map(|hash| *hash.as_bytes()),
-                revision.canonical_bytes()
-            ],
+            "INSERT INTO roster_revisions (hash, canonical) VALUES (?1, ?2)",
+            params![hash.as_bytes(), revision.canonical_bytes()],
         )?;
         transaction.commit()?;
         Ok(())
@@ -295,28 +278,20 @@ impl StateStore {
     }
 
     pub fn selected_roster_chain(&self) -> Result<Vec<RosterRevision>, StateError> {
-        let mut statement = self.connection.prepare(
-            "SELECT hash, revision_number, parent_hash, canonical FROM roster_revisions",
-        )?;
+        let mut statement = self
+            .connection
+            .prepare("SELECT hash, canonical FROM roster_revisions")?;
         let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, Option<Vec<u8>>>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
-            ))
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
         })?;
         let mut revisions = BTreeMap::new();
         for row in rows {
-            let (stored_hash, stored_number, stored_parent, canonical) = row?;
+            let (stored_hash, canonical) = row?;
             let revision = RosterRevision::from_canonical(&canonical)?;
             let hash = roster_hash_from_blob(stored_hash)?;
-            if revision.canonical_hash() != hash
-                || i64::try_from(revision.number()).ok() != Some(stored_number)
-                || revision.parent_hash() != stored_parent.map(roster_hash_from_blob).transpose()?
-            {
+            if revision.canonical_hash() != hash {
                 return Err(StateError::InvalidStoredState(
-                    "roster index fields do not match canonical bytes",
+                    "roster hash does not match canonical bytes",
                 ));
             }
             if revisions.insert(hash, revision).is_some() {
@@ -642,28 +617,39 @@ impl StateStore {
                 |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
             )
             .optional()?;
-        stored.map(decode_stored_record).transpose()
+        stored
+            .map(|stored| decode_indexed_record(stored, collection, path))
+            .transpose()
     }
 
     pub fn records(&self, collection: &str) -> Result<Vec<Record>, StateError> {
         let mut statement = self.connection.prepare(
-            "SELECT record_hash, canonical FROM path_records
+            "SELECT path, record_hash, canonical FROM path_records
              WHERE collection = ?1 ORDER BY path",
         )?;
         let rows = statement.query_map([collection], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
         })?;
-        rows.map(|row| decode_stored_record(row?)).collect()
+        rows.map(|row| {
+            let (path, hash, canonical) = row?;
+            decode_indexed_record((hash, canonical), collection, &path)
+        })
+        .collect()
     }
 
     pub fn record_states(&self, collection: &str) -> Result<Vec<PathRecordState>, StateError> {
         let mut statement = self.connection.prepare(
-            "SELECT record_hash, canonical, materialized, needs_repair,
+            "SELECT path, record_hash, canonical, materialized,
                     materialized_modified_ns, materialized_size, materialized_hash
              FROM path_records WHERE collection = ?1 ORDER BY path",
         )?;
         let rows = statement.query_map([collection], stored_path_record_state)?;
-        rows.map(|row| decode_path_record_state(row?)).collect()
+        rows.map(|row| decode_path_record_state(row?, collection))
+            .collect()
     }
 
     pub fn record_state(
@@ -674,31 +660,32 @@ impl StateStore {
         let stored = self
             .connection
             .query_row(
-                "SELECT record_hash, canonical, materialized, needs_repair,
+                "SELECT path, record_hash, canonical, materialized,
                         materialized_modified_ns, materialized_size, materialized_hash
                  FROM path_records WHERE collection = ?1 AND path = ?2",
                 params![collection, path],
                 stored_path_record_state,
             )
             .optional()?;
-        stored.map(decode_path_record_state).transpose()
+        stored
+            .map(|stored| decode_path_record_state(stored, collection))
+            .transpose()
     }
 
-    pub fn set_repair_required(
+    #[cfg(test)]
+    pub(crate) fn set_repair_required(
         &self,
         collection: &str,
         path: &str,
-        required: bool,
     ) -> Result<(), StateError> {
         self.connection.execute(
             "UPDATE path_records SET
-                needs_repair = ?3,
-                materialized = CASE WHEN ?3 THEN 0 ELSE materialized END,
-                materialized_modified_ns = CASE WHEN ?3 THEN NULL ELSE materialized_modified_ns END,
-                materialized_size = CASE WHEN ?3 THEN NULL ELSE materialized_size END,
-                materialized_hash = CASE WHEN ?3 THEN NULL ELSE materialized_hash END
+                materialized = 0,
+                materialized_modified_ns = NULL,
+                materialized_size = NULL,
+                materialized_hash = NULL
              WHERE collection = ?1 AND path = ?2",
-            params![collection, path, required],
+            params![collection, path],
         )?;
         Ok(())
     }
@@ -716,7 +703,6 @@ impl StateStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let updated = transaction.execute(
             "UPDATE path_records SET
-                needs_repair = 1,
                 materialized = 0,
                 materialized_modified_ns = NULL,
                 materialized_size = NULL,
@@ -775,7 +761,6 @@ impl StateStore {
             transaction.execute(
                 "UPDATE path_records SET
                     materialized = 0,
-                    needs_repair = 1,
                     materialized_modified_ns = NULL,
                     materialized_size = NULL,
                     materialized_hash = NULL
@@ -801,7 +786,7 @@ impl StateStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let updated = transaction.execute(
-            "UPDATE path_records SET materialized = 1, needs_repair = 0
+            "UPDATE path_records SET materialized = 1
              WHERE collection = ?1 AND path = ?2 AND kind = 0",
             params![collection, path],
         )?;
@@ -829,7 +814,7 @@ impl StateStore {
         let (files, degraded): (i64, i64) = self.connection.query_row(
             "SELECT
                 coalesce(sum(CASE WHEN kind = 1 AND materialized = 1 THEN 1 ELSE 0 END), 0),
-                coalesce(sum(CASE WHEN needs_repair = 1 THEN 1 ELSE 0 END), 0)
+                coalesce(sum(CASE WHEN materialized = 0 THEN 1 ELSE 0 END), 0)
              FROM path_records",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -878,14 +863,11 @@ impl StateStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
-            "INSERT INTO peer_health (endpoint_id, reachable, last_attempt_ns, last_success_ns)
-             VALUES (?1, ?2, ?3, CASE WHEN ?2 THEN ?3 ELSE NULL END)
+            "INSERT INTO peer_health (endpoint_id, reachable)
+             VALUES (?1, ?2)
              ON CONFLICT(endpoint_id) DO UPDATE SET
-                reachable = excluded.reachable,
-                last_attempt_ns = excluded.last_attempt_ns,
-                last_success_ns = CASE WHEN excluded.reachable
-                    THEN excluded.last_attempt_ns ELSE peer_health.last_success_ns END",
-            params![endpoint_id.as_bytes(), reachable, observed_ns],
+                reachable = excluded.reachable",
+            params![endpoint_id.as_bytes(), reachable],
         )?;
         insert_log(&transaction, observed_ns, event, max_logs)?;
         transaction.commit()?;
@@ -928,73 +910,37 @@ impl StateStore {
 
     pub fn logs(&self) -> Result<Vec<OperationalLog>, StateError> {
         let mut statement = self.connection.prepare(
-            "SELECT id, created_ns, event_kind, collection, path, peer_endpoint,
-                    candidate_modified_ns, candidate_author,
-                    winner_modified_ns, winner_author
+            "SELECT id, created_ns,
+                    CASE WHEN typeof(payload) = 'blob' THEN
+                        CASE WHEN length(payload) BETWEEN 1 AND 16384
+                             THEN payload END
+                    END
              FROM operational_logs ORDER BY id",
         )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                StoredOperationalEvent {
-                    event_kind: row.get(2)?,
-                    collection: row.get(3)?,
-                    path: row.get(4)?,
-                    peer_endpoint: row.get(5)?,
-                    candidate_modified_ns: row.get(6)?,
-                    candidate_author: row.get(7)?,
-                    winner_modified_ns: row.get(8)?,
-                    winner_author: row.get(9)?,
-                },
-            ))
-        })?;
-        rows.map(|row| {
-            let (id, created_ns, stored_event) = row?;
-            Ok(OperationalLog {
-                id,
-                created_ns,
-                event: decode_operational_event(stored_event)?,
-            })
-        })
-        .collect()
+        let mut rows = statement.query([])?;
+        let mut logs = Vec::new();
+        while let Some(row) = rows.next()? {
+            logs.push(decode_operational_log_row(row)?);
+        }
+        Ok(logs)
     }
 
     pub fn logs_page(&self, after_id: i64, limit: usize) -> Result<OperationalLogPage, StateError> {
         let limit = limit.clamp(1, 64);
         let query_limit = i64::try_from(limit + 1).map_err(|_| StateError::NumberOverflow)?;
         let mut statement = self.connection.prepare(
-            "SELECT id, created_ns, event_kind, collection, path, peer_endpoint,
-                    candidate_modified_ns, candidate_author,
-                    winner_modified_ns, winner_author
+            "SELECT id, created_ns,
+                    CASE WHEN typeof(payload) = 'blob' THEN
+                        CASE WHEN length(payload) BETWEEN 1 AND 16384
+                             THEN payload END
+                    END
              FROM operational_logs WHERE id > ?1 ORDER BY id LIMIT ?2",
         )?;
-        let rows = statement.query_map(params![after_id, query_limit], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                StoredOperationalEvent {
-                    event_kind: row.get(2)?,
-                    collection: row.get(3)?,
-                    path: row.get(4)?,
-                    peer_endpoint: row.get(5)?,
-                    candidate_modified_ns: row.get(6)?,
-                    candidate_author: row.get(7)?,
-                    winner_modified_ns: row.get(8)?,
-                    winner_author: row.get(9)?,
-                },
-            ))
-        })?;
-        let mut logs = rows
-            .map(|row| {
-                let (id, created_ns, stored) = row?;
-                Ok(OperationalLog {
-                    id,
-                    created_ns,
-                    event: decode_operational_event(stored)?,
-                })
-            })
-            .collect::<Result<Vec<_>, StateError>>()?;
+        let mut rows = statement.query(params![after_id, query_limit])?;
+        let mut logs = Vec::new();
+        while let Some(row) = rows.next()? {
+            logs.push(decode_operational_log_row(row)?);
+        }
         let has_more = logs.len() > limit;
         logs.truncate(limit);
         let next_after_id = logs.last().map_or(after_id, |log| log.id);
@@ -1015,38 +961,41 @@ impl StateStore {
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
             transaction.execute_batch(
-                "CREATE TABLE identity_refs (
-                    slot TEXT PRIMARY KEY NOT NULL CHECK (slot <> ''),
-                    backend TEXT NOT NULL CHECK (backend IN ('keyring', 'file')),
-                    locator BLOB NOT NULL CHECK (length(locator) > 0)
-                );
-                CREATE TABLE roster_revisions (
+                "CREATE TABLE roster_revisions (
                     hash BLOB PRIMARY KEY NOT NULL CHECK (length(hash) = 32),
-                    revision_number INTEGER NOT NULL CHECK (revision_number >= 0),
-                    parent_hash BLOB REFERENCES roster_revisions(hash),
-                    canonical BLOB NOT NULL UNIQUE
+                    canonical BLOB NOT NULL UNIQUE CHECK (length(canonical) > 0)
                 );
-                CREATE INDEX roster_revisions_parent ON roster_revisions(parent_hash);
                 CREATE TABLE collections (
                     name TEXT PRIMARY KEY NOT NULL CHECK (name <> ''),
                     local_path BLOB NOT NULL CHECK (length(local_path) > 0),
-                    resolved_root BLOB
+                    resolved_root BLOB,
+                    scan_status TEXT NOT NULL DEFAULT 'pending' CHECK (
+                        scan_status IN ('pending', 'active', 'missing', 'not_directory', 'error')
+                    ),
+                    watch_status TEXT NOT NULL DEFAULT 'pending' CHECK (
+                        watch_status IN ('pending', 'active', 'root_unavailable', 'backend_error')
+                    )
                 );
                 CREATE TABLE path_records (
                     collection TEXT NOT NULL REFERENCES collections(name) ON DELETE CASCADE,
                     path TEXT NOT NULL CHECK (path <> ''),
                     record_hash BLOB NOT NULL CHECK (length(record_hash) = 32),
-                    modified_ns INTEGER NOT NULL,
-                    author BLOB NOT NULL CHECK (length(author) = 32),
                     kind INTEGER NOT NULL CHECK (kind IN (0, 1)),
-                    file_size INTEGER,
-                    content_hash BLOB,
-                    canonical BLOB NOT NULL,
-                    needs_repair INTEGER NOT NULL DEFAULT 0 CHECK (needs_repair IN (0, 1)),
+                    canonical BLOB NOT NULL CHECK (length(canonical) > 0),
+                    materialized INTEGER NOT NULL CHECK (materialized IN (0, 1)),
+                    materialized_modified_ns INTEGER,
+                    materialized_size INTEGER,
+                    materialized_hash BLOB,
                     PRIMARY KEY (collection, path),
                     CHECK (
-                        (kind = 0 AND file_size IS NULL AND content_hash IS NULL) OR
-                        (kind = 1 AND file_size >= 0 AND length(content_hash) = 32)
+                        (kind = 0 AND materialized_modified_ns IS NULL AND
+                         materialized_size IS NULL AND materialized_hash IS NULL) OR
+                        (kind = 1 AND materialized = 0 AND
+                         materialized_modified_ns IS NULL AND materialized_size IS NULL AND
+                         materialized_hash IS NULL) OR
+                        (kind = 1 AND materialized = 1 AND
+                         materialized_modified_ns IS NOT NULL AND materialized_size >= 0 AND
+                         length(materialized_hash) = 32)
                     )
                 );
                 CREATE TABLE peer_hints (
@@ -1058,247 +1007,63 @@ impl StateStore {
                 CREATE TABLE operational_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     created_ns INTEGER NOT NULL,
-                    event_kind TEXT NOT NULL CHECK (
-                        event_kind IN (
-                            'state_opened', 'record_accepted',
-                            'record_rejected', 'peer_unreachable'
-                        )
-                    ),
-                    collection TEXT CHECK (
-                        collection IS NULL OR length(collection) BETWEEN 1 AND 255
-                    ),
-                    path TEXT CHECK (path IS NULL OR length(path) BETWEEN 1 AND 4096),
-                    peer_endpoint BLOB CHECK (
-                        peer_endpoint IS NULL OR length(peer_endpoint) = 32
-                    ),
-                    candidate_modified_ns INTEGER,
-                    candidate_author BLOB CHECK (
-                        candidate_author IS NULL OR length(candidate_author) = 32
-                    ),
-                    winner_modified_ns INTEGER,
-                    winner_author BLOB CHECK (
-                        winner_author IS NULL OR length(winner_author) = 32
-                    ),
-                    CHECK (
-                        (event_kind = 'state_opened' AND
-                         collection IS NULL AND path IS NULL AND peer_endpoint IS NULL AND
-                         candidate_modified_ns IS NULL AND candidate_author IS NULL AND
-                         winner_modified_ns IS NULL AND winner_author IS NULL) OR
-                        (event_kind = 'record_accepted' AND
-                         collection IS NOT NULL AND path IS NOT NULL AND
-                         candidate_modified_ns IS NULL AND candidate_author IS NULL AND
-                         winner_modified_ns IS NULL AND winner_author IS NULL) OR
-                        (event_kind = 'record_rejected' AND
-                         collection IS NOT NULL AND path IS NOT NULL AND
-                         candidate_modified_ns IS NOT NULL AND candidate_author IS NOT NULL AND
-                         winner_modified_ns IS NOT NULL AND winner_author IS NOT NULL) OR
-                        (event_kind = 'peer_unreachable' AND
-                         collection IS NULL AND path IS NULL AND peer_endpoint IS NOT NULL AND
-                         candidate_modified_ns IS NULL AND candidate_author IS NULL AND
-                         winner_modified_ns IS NULL AND winner_author IS NULL)
+                    payload BLOB NOT NULL CHECK (
+                        typeof(payload) = 'blob' AND length(payload) BETWEEN 1 AND 16384
                     )
                 );
+                CREATE TABLE peer_health (
+                    endpoint_id BLOB PRIMARY KEY NOT NULL CHECK (length(endpoint_id) = 32),
+                    reachable INTEGER NOT NULL CHECK (reachable IN (0, 1))
+                );
+                PRAGMA application_id = 1397445465;
                 PRAGMA user_version = 1;",
             )?;
             transaction.commit()?;
         }
-        if version < 2 {
-            let transaction = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute_batch(
-                "ALTER TABLE operational_logs RENAME TO operational_logs_v1;
-                 CREATE TABLE operational_logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    created_ns INTEGER NOT NULL,
-                    event_kind TEXT NOT NULL CHECK (
-                        event_kind IN (
-                            'state_opened', 'daemon_started', 'daemon_stopped',
-                            'collection_attached', 'collection_detached',
-                            'collection_paused', 'collection_scanned',
-                            'symlink_escape', 'symlink_cycle', 'path_rejected',
-                            'timestamp_rejected', 'record_accepted',
-                            'record_rejected', 'file_installed',
-                            'file_apply_rejected', 'repair_required',
-                            'peer_unreachable'
-                        )
-                    ),
-                    collection TEXT CHECK (
-                        collection IS NULL OR length(collection) BETWEEN 1 AND 255
-                    ),
-                    path TEXT CHECK (path IS NULL OR length(path) BETWEEN 1 AND 4096),
-                    peer_endpoint BLOB CHECK (
-                        peer_endpoint IS NULL OR length(peer_endpoint) = 32
-                    ),
-                    candidate_modified_ns INTEGER,
-                    candidate_author BLOB CHECK (
-                        candidate_author IS NULL OR length(candidate_author) = 32
-                    ),
-                    winner_modified_ns INTEGER,
-                    winner_author BLOB CHECK (
-                        winner_author IS NULL OR length(winner_author) = 32
-                    )
-                 );
-                 INSERT INTO operational_logs
-                    (id, created_ns, event_kind, collection, path, peer_endpoint,
-                     candidate_modified_ns, candidate_author,
-                     winner_modified_ns, winner_author)
-                 SELECT id, created_ns, event_kind, collection, path, peer_endpoint,
-                        candidate_modified_ns, candidate_author,
-                        winner_modified_ns, winner_author
-                 FROM operational_logs_v1;
-                 DROP TABLE operational_logs_v1;
-                 PRAGMA user_version = 2;",
-            )?;
-            transaction.commit()?;
+        self.validate_current_schema()?;
+        Ok(())
+    }
+
+    fn validate_current_schema(&self) -> Result<(), StateError> {
+        let application_id: i64 =
+            self.connection
+                .pragma_query_value(None, "application_id", |row| row.get(0))?;
+        if application_id != SCHEMA_APPLICATION_ID {
+            return Err(StateError::InvalidStoredState(
+                "database schema identity is not recognized",
+            ));
         }
-        if version < 3 {
-            let transaction = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute_batch(
-                "ALTER TABLE collections ADD COLUMN scan_status TEXT NOT NULL
-                    DEFAULT 'pending' CHECK (
-                        scan_status IN ('pending', 'active', 'missing', 'not_directory', 'error')
-                    );
-                 ALTER TABLE collections ADD COLUMN watch_status TEXT NOT NULL
-                    DEFAULT 'pending' CHECK (
-                        watch_status IN ('pending', 'active', 'root_unavailable', 'backend_error')
-                    );
-                 ALTER TABLE path_records ADD COLUMN materialized INTEGER NOT NULL
-                    DEFAULT 1 CHECK (materialized IN (0, 1));
-                 UPDATE path_records SET materialized = NOT needs_repair;
-                 PRAGMA user_version = 3;",
-            )?;
-            transaction.commit()?;
+
+        let mut statement = self.connection.prepare(
+            "SELECT name FROM sqlite_schema
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+             ORDER BY name",
+        )?;
+        let stored_tables = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let expected_tables = SCHEMA_TABLES
+            .iter()
+            .map(|(name, _)| (*name).to_owned())
+            .collect::<Vec<_>>();
+        if stored_tables != expected_tables {
+            return Err(StateError::InvalidStoredState(
+                "database table shape is not recognized",
+            ));
         }
-        if version < 4 {
-            let transaction = self
+
+        for (table, expected_columns) in SCHEMA_TABLES {
+            let mut statement = self
                 .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute_batch(
-                "ALTER TABLE path_records ADD COLUMN materialized_modified_ns INTEGER;
-                 ALTER TABLE path_records ADD COLUMN materialized_size INTEGER;
-                 ALTER TABLE path_records ADD COLUMN materialized_hash BLOB;
-                 UPDATE path_records SET
-                    materialized_modified_ns = modified_ns,
-                    materialized_size = file_size,
-                    materialized_hash = content_hash
-                 WHERE kind = 1 AND materialized = 1;
-                 PRAGMA user_version = 4;",
-            )?;
-            transaction.commit()?;
-        }
-        if version < 5 {
-            let transaction = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute_batch(
-                "ALTER TABLE operational_logs RENAME TO operational_logs_v4;
-                 CREATE TABLE operational_logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    created_ns INTEGER NOT NULL,
-                    event_kind TEXT NOT NULL CHECK (
-                        event_kind IN (
-                            'state_opened', 'daemon_started', 'daemon_stopped',
-                            'collection_attached', 'collection_detached',
-                            'collection_paused', 'collection_scanned',
-                            'symlink_escape', 'symlink_cycle', 'path_rejected',
-                            'timestamp_rejected', 'record_accepted',
-                            'record_rejected', 'file_installed',
-                            'file_apply_rejected', 'repair_required',
-                            'peer_unreachable', 'peer_attempted',
-                            'peer_synchronized', 'peer_rejected',
-                            'file_sent', 'file_received', 'transfer_rejected'
-                        )
-                    ),
-                    collection TEXT CHECK (
-                        collection IS NULL OR length(collection) BETWEEN 1 AND 255
-                    ),
-                    path TEXT CHECK (path IS NULL OR length(path) BETWEEN 1 AND 4096),
-                    peer_endpoint BLOB CHECK (
-                        peer_endpoint IS NULL OR length(peer_endpoint) = 32
-                    ),
-                    candidate_modified_ns INTEGER,
-                    candidate_author BLOB CHECK (
-                        candidate_author IS NULL OR length(candidate_author) = 32
-                    ),
-                    winner_modified_ns INTEGER,
-                    winner_author BLOB CHECK (
-                        winner_author IS NULL OR length(winner_author) = 32
-                    )
-                 );
-                 INSERT INTO operational_logs
-                    (id, created_ns, event_kind, collection, path, peer_endpoint,
-                     candidate_modified_ns, candidate_author,
-                     winner_modified_ns, winner_author)
-                 SELECT id, created_ns, event_kind, collection, path, peer_endpoint,
-                        candidate_modified_ns, candidate_author,
-                        winner_modified_ns, winner_author
-                 FROM operational_logs_v4;
-                 DROP TABLE operational_logs_v4;
-                 CREATE TABLE peer_health (
-                    endpoint_id BLOB PRIMARY KEY NOT NULL CHECK (length(endpoint_id) = 32),
-                    reachable INTEGER NOT NULL CHECK (reachable IN (0, 1)),
-                    last_attempt_ns INTEGER NOT NULL,
-                    last_success_ns INTEGER
-                 );
-                 PRAGMA user_version = 5;",
-            )?;
-            transaction.commit()?;
-        }
-        if version < 6 {
-            let transaction = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute_batch(
-                "ALTER TABLE operational_logs RENAME TO operational_logs_v5;
-                 CREATE TABLE operational_logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    created_ns INTEGER NOT NULL,
-                    event_kind TEXT NOT NULL CHECK (
-                        event_kind IN (
-                            'state_opened', 'daemon_started', 'daemon_stopped',
-                            'collection_attached', 'collection_detached',
-                            'collection_paused', 'collection_scanned',
-                            'symlink_escape', 'symlink_cycle', 'path_rejected',
-                            'timestamp_rejected', 'record_accepted',
-                            'record_rejected', 'file_installed',
-                            'file_apply_rejected', 'repair_required',
-                            'peer_unreachable', 'peer_attempted',
-                            'peer_synchronized', 'peer_rejected',
-                            'peer_session_failed', 'file_sent', 'file_received',
-                            'transfer_rejected'
-                        )
-                    ),
-                    collection TEXT CHECK (
-                        collection IS NULL OR length(collection) BETWEEN 1 AND 255
-                    ),
-                    path TEXT CHECK (path IS NULL OR length(path) BETWEEN 1 AND 4096),
-                    peer_endpoint BLOB CHECK (
-                        peer_endpoint IS NULL OR length(peer_endpoint) = 32
-                    ),
-                    candidate_modified_ns INTEGER,
-                    candidate_author BLOB CHECK (
-                        candidate_author IS NULL OR length(candidate_author) = 32
-                    ),
-                    winner_modified_ns INTEGER,
-                    winner_author BLOB CHECK (
-                        winner_author IS NULL OR length(winner_author) = 32
-                    )
-                 );
-                 INSERT INTO operational_logs
-                    (id, created_ns, event_kind, collection, path, peer_endpoint,
-                     candidate_modified_ns, candidate_author,
-                     winner_modified_ns, winner_author)
-                 SELECT id, created_ns, event_kind, collection, path, peer_endpoint,
-                        candidate_modified_ns, candidate_author,
-                        winner_modified_ns, winner_author
-                 FROM operational_logs_v5;
-                 DROP TABLE operational_logs_v5;
-                 PRAGMA user_version = 6;",
-            )?;
-            transaction.commit()?;
+                .prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")?;
+            let stored_columns = statement
+                .query_map([table], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            if stored_columns != expected_columns {
+                return Err(StateError::InvalidStoredState(
+                    "database column shape is not recognized",
+                ));
+            }
         }
         Ok(())
     }
@@ -1434,9 +1199,9 @@ pub enum LogLevel {
     Warn,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OperationalEvent {
-    StateOpened,
     DaemonStarted,
     DaemonStopped,
     CollectionAttached {
@@ -1514,7 +1279,8 @@ pub enum OperationalEvent {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CollectionIssue {
     SymlinkEscape,
     SymlinkCycle,
@@ -1525,7 +1291,7 @@ pub enum CollectionIssue {
 impl OperationalEvent {
     pub const fn level(&self) -> LogLevel {
         match self {
-            Self::StateOpened | Self::CollectionScanned { .. } => LogLevel::Debug,
+            Self::CollectionScanned { .. } => LogLevel::Debug,
             Self::DaemonStarted
             | Self::DaemonStopped
             | Self::CollectionAttached { .. }
@@ -1579,15 +1345,8 @@ fn insert_roster_revision_row(
 ) -> Result<(), StateError> {
     let hash = revision.canonical_hash();
     transaction.execute(
-        "INSERT INTO roster_revisions
-            (hash, revision_number, parent_hash, canonical)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![
-            hash.as_bytes(),
-            i64::try_from(revision.number()).map_err(|_| StateError::NumberOverflow)?,
-            revision.parent_hash().map(|hash| *hash.as_bytes()),
-            revision.canonical_bytes()
-        ],
+        "INSERT INTO roster_revisions (hash, canonical) VALUES (?1, ?2)",
+        params![hash.as_bytes(), revision.canonical_bytes()],
     )?;
     Ok(())
 }
@@ -1650,14 +1409,9 @@ fn upsert_record(
     record: &Record,
     materialized: bool,
 ) -> Result<(), StateError> {
-    let (kind, file_size, content_hash): (i64, Option<i64>, Option<[u8; 32]>) = match record.kind()
-    {
-        crate::record::RecordKind::Tombstone => (0, None, None),
-        crate::record::RecordKind::File { size, content_hash } => (
-            1,
-            Some(i64::try_from(size).map_err(|_| StateError::NumberOverflow)?),
-            Some(content_hash),
-        ),
+    let kind = match record.kind() {
+        crate::record::RecordKind::Tombstone => 0,
+        crate::record::RecordKind::File { .. } => 1,
     };
     let materialized_fingerprint = if materialized {
         match record.kind() {
@@ -1675,21 +1429,15 @@ fn upsert_record(
     };
     transaction.execute(
         "INSERT INTO path_records
-            (collection, path, record_hash, modified_ns, author, kind, file_size,
-             content_hash, canonical, needs_repair, materialized,
+            (collection, path, record_hash, kind, canonical, materialized,
              materialized_modified_ns, materialized_size, materialized_hash)
          VALUES (
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NOT ?10, ?10, ?11, ?12, ?13
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
          )
          ON CONFLICT(collection, path) DO UPDATE SET
             record_hash = excluded.record_hash,
-            modified_ns = excluded.modified_ns,
-            author = excluded.author,
             kind = excluded.kind,
-            file_size = excluded.file_size,
-            content_hash = excluded.content_hash,
             canonical = excluded.canonical,
-            needs_repair = excluded.needs_repair,
             materialized = excluded.materialized,
             materialized_modified_ns = excluded.materialized_modified_ns,
             materialized_size = excluded.materialized_size,
@@ -1698,11 +1446,7 @@ fn upsert_record(
             record.collection(),
             record.path().as_str(),
             record.canonical_hash().as_bytes(),
-            record.modified_ns(),
-            record.author().as_bytes(),
             kind,
-            file_size,
-            content_hash,
             record.canonical_bytes(),
             materialized,
             materialized_fingerprint.map(|value| value.modified_ns),
@@ -1726,7 +1470,6 @@ fn update_materialized_fingerprint(
     let updated = transaction.execute(
         "UPDATE path_records SET
             materialized = 1,
-            needs_repair = 0,
             materialized_modified_ns = ?3,
             materialized_size = ?4,
             materialized_hash = ?5
@@ -1768,9 +1511,9 @@ fn decode_materialized_fingerprint(
 }
 
 type StoredPathRecordState = (
+    String,
     Vec<u8>,
     Vec<u8>,
-    bool,
     bool,
     Option<i64>,
     Option<i64>,
@@ -1789,20 +1532,23 @@ fn stored_path_record_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredP
     ))
 }
 
-fn decode_path_record_state(stored: StoredPathRecordState) -> Result<PathRecordState, StateError> {
+fn decode_path_record_state(
+    stored: StoredPathRecordState,
+    collection: &str,
+) -> Result<PathRecordState, StateError> {
     let (
+        path,
         hash,
         canonical,
         materialized,
-        needs_repair,
         materialized_modified_ns,
         materialized_size,
         materialized_hash,
     ) = stored;
     Ok(PathRecordState {
-        record: decode_stored_record((hash, canonical))?,
+        record: decode_indexed_record((hash, canonical), collection, &path)?,
         materialized,
-        needs_repair,
+        needs_repair: !materialized,
         materialized_fingerprint: decode_materialized_fingerprint(
             materialized_modified_ns,
             materialized_size,
@@ -1824,7 +1570,9 @@ fn load_record(
             |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )
         .optional()?;
-    stored.map(decode_stored_record).transpose()
+    stored
+        .map(|stored| decode_indexed_record(stored, collection, path))
+        .transpose()
 }
 
 fn decode_stored_record(stored: (Vec<u8>, Vec<u8>)) -> Result<Record, StateError> {
@@ -1838,225 +1586,37 @@ fn decode_stored_record(stored: (Vec<u8>, Vec<u8>)) -> Result<Record, StateError
     Ok(record)
 }
 
+fn decode_indexed_record(
+    stored: (Vec<u8>, Vec<u8>),
+    collection: &str,
+    path: &str,
+) -> Result<Record, StateError> {
+    let record = decode_stored_record(stored)?;
+    if record.collection() != collection || record.path().as_str() != path {
+        return Err(StateError::InvalidStoredState(
+            "record index does not match canonical bytes",
+        ));
+    }
+    Ok(record)
+}
+
 fn insert_log(
     transaction: &Transaction<'_>,
     created_ns: i64,
     event: &OperationalEvent,
     max_logs: usize,
 ) -> Result<(), StateError> {
-    let (
-        event_kind,
-        collection,
-        path,
-        peer_endpoint,
-        candidate_modified_ns,
-        candidate_author,
-        winner_modified_ns,
-        winner_author,
-    ) = match event {
-        OperationalEvent::StateOpened => ("state_opened", None, None, None, None, None, None, None),
-        OperationalEvent::DaemonStarted => {
-            ("daemon_started", None, None, None, None, None, None, None)
-        }
-        OperationalEvent::DaemonStopped => {
-            ("daemon_stopped", None, None, None, None, None, None, None)
-        }
-        OperationalEvent::CollectionAttached { collection } => (
-            "collection_attached",
-            Some(collection.as_str()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ),
-        OperationalEvent::CollectionDetached { collection } => (
-            "collection_detached",
-            Some(collection.as_str()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ),
-        OperationalEvent::CollectionPaused { collection } => (
-            "collection_paused",
-            Some(collection.as_str()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ),
-        OperationalEvent::CollectionScanned { collection } => (
-            "collection_scanned",
-            Some(collection.as_str()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ),
-        OperationalEvent::CollectionWarning {
-            collection,
-            path,
-            issue,
-        } => (
-            match issue {
-                CollectionIssue::SymlinkEscape => "symlink_escape",
-                CollectionIssue::SymlinkCycle => "symlink_cycle",
-                CollectionIssue::PathRejected => "path_rejected",
-                CollectionIssue::TimestampRejected => "timestamp_rejected",
-            },
-            Some(collection.as_str()),
-            path.as_ref().map(ProtocolPath::as_str),
-            None,
-            None,
-            None,
-            None,
-            None,
-        ),
-        OperationalEvent::RecordAccepted {
-            collection,
-            path,
-            source_peer,
-        } => (
-            "record_accepted",
-            Some(collection.as_str()),
-            Some(path.as_str()),
-            source_peer.map(|endpoint| *endpoint.as_bytes()),
-            None,
-            None,
-            None,
-            None,
-        ),
-        OperationalEvent::RecordRejected {
-            collection,
-            path,
-            source_peer,
-            candidate_modified_ns,
-            candidate_author,
-            winner_modified_ns,
-            winner_author,
-        } => (
-            "record_rejected",
-            Some(collection.as_str()),
-            Some(path.as_str()),
-            source_peer.map(|endpoint| *endpoint.as_bytes()),
-            Some(*candidate_modified_ns),
-            Some(*candidate_author.as_bytes()),
-            Some(*winner_modified_ns),
-            Some(*winner_author.as_bytes()),
-        ),
-        OperationalEvent::FileInstalled { collection, path } => (
-            "file_installed",
-            Some(collection.as_str()),
-            Some(path.as_str()),
-            None,
-            None,
-            None,
-            None,
-            None,
-        ),
-        OperationalEvent::FileApplyRejected { collection, path } => (
-            "file_apply_rejected",
-            Some(collection.as_str()),
-            Some(path.as_str()),
-            None,
-            None,
-            None,
-            None,
-            None,
-        ),
-        OperationalEvent::RepairRequired { collection, path } => (
-            "repair_required",
-            Some(collection.as_str()),
-            Some(path.as_str()),
-            None,
-            None,
-            None,
-            None,
-            None,
-        ),
-        OperationalEvent::PeerUnreachable { peer_endpoint } => (
-            "peer_unreachable",
-            None,
-            None,
-            Some(*peer_endpoint.as_bytes()),
-            None,
-            None,
-            None,
-            None,
-        ),
-        OperationalEvent::PeerAttempted { peer_endpoint }
-        | OperationalEvent::PeerSynchronized { peer_endpoint }
-        | OperationalEvent::PeerRejected { peer_endpoint }
-        | OperationalEvent::PeerSessionFailed { peer_endpoint } => (
-            match event {
-                OperationalEvent::PeerAttempted { .. } => "peer_attempted",
-                OperationalEvent::PeerSynchronized { .. } => "peer_synchronized",
-                OperationalEvent::PeerRejected { .. } => "peer_rejected",
-                OperationalEvent::PeerSessionFailed { .. } => "peer_session_failed",
-                _ => unreachable!(),
-            },
-            None,
-            None,
-            Some(*peer_endpoint.as_bytes()),
-            None,
-            None,
-            None,
-            None,
-        ),
-        OperationalEvent::FileSent {
-            collection,
-            path,
-            peer_endpoint,
-        }
-        | OperationalEvent::FileReceived {
-            collection,
-            path,
-            peer_endpoint,
-        }
-        | OperationalEvent::TransferRejected {
-            collection,
-            path,
-            peer_endpoint,
-        } => (
-            match event {
-                OperationalEvent::FileSent { .. } => "file_sent",
-                OperationalEvent::FileReceived { .. } => "file_received",
-                OperationalEvent::TransferRejected { .. } => "transfer_rejected",
-                _ => unreachable!(),
-            },
-            Some(collection.as_str()),
-            Some(path.as_str()),
-            Some(*peer_endpoint.as_bytes()),
-            None,
-            None,
-            None,
-            None,
-        ),
-    };
+    validate_operational_event(event)?;
+    let payload = serde_json::to_vec(event)
+        .map_err(|_| StateError::InvalidStoredState("operational event cannot be encoded"))?;
+    if payload.len() > MAX_OPERATIONAL_EVENT_BYTES {
+        return Err(StateError::InvalidStoredState(
+            "operational event exceeds its encoded size limit",
+        ));
+    }
     transaction.execute(
-        "INSERT INTO operational_logs
-            (created_ns, event_kind, collection, path, peer_endpoint,
-             candidate_modified_ns, candidate_author, winner_modified_ns, winner_author)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![
-            created_ns,
-            event_kind,
-            collection,
-            path,
-            peer_endpoint,
-            candidate_modified_ns,
-            candidate_author,
-            winner_modified_ns,
-            winner_author,
-        ],
+        "INSERT INTO operational_logs (created_ns, payload) VALUES (?1, ?2)",
+        params![created_ns, payload],
     )?;
     let max_logs = i64::try_from(max_logs).map_err(|_| StateError::NumberOverflow)?;
     transaction.execute(
@@ -2069,141 +1629,84 @@ fn insert_log(
     Ok(())
 }
 
-struct StoredOperationalEvent {
-    event_kind: String,
-    collection: Option<String>,
-    path: Option<String>,
-    peer_endpoint: Option<Vec<u8>>,
-    candidate_modified_ns: Option<i64>,
-    candidate_author: Option<Vec<u8>>,
-    winner_modified_ns: Option<i64>,
-    winner_author: Option<Vec<u8>>,
+fn decode_operational_log_row(row: &rusqlite::Row<'_>) -> Result<OperationalLog, StateError> {
+    let payload = row
+        .get::<_, Option<Vec<u8>>>(2)?
+        .ok_or(StateError::InvalidStoredState(
+            "operational event payload has invalid storage",
+        ))?;
+    Ok(OperationalLog {
+        id: row.get(0)?,
+        created_ns: row.get(1)?,
+        event: decode_operational_event(&payload)?,
+    })
 }
 
-fn decode_operational_event(
-    stored: StoredOperationalEvent,
-) -> Result<OperationalEvent, StateError> {
-    let peer_endpoint = stored.peer_endpoint.map(endpoint_from_blob).transpose()?;
-    match stored.event_kind.as_str() {
-        "state_opened" => Ok(OperationalEvent::StateOpened),
-        "daemon_started" => Ok(OperationalEvent::DaemonStarted),
-        "daemon_stopped" => Ok(OperationalEvent::DaemonStopped),
-        "collection_attached" => Ok(OperationalEvent::CollectionAttached {
-            collection: required(stored.collection, "collection log name is missing")?,
-        }),
-        "collection_detached" => Ok(OperationalEvent::CollectionDetached {
-            collection: required(stored.collection, "collection log name is missing")?,
-        }),
-        "collection_paused" => Ok(OperationalEvent::CollectionPaused {
-            collection: required(stored.collection, "collection log name is missing")?,
-        }),
-        "collection_scanned" => Ok(OperationalEvent::CollectionScanned {
-            collection: required(stored.collection, "collection log name is missing")?,
-        }),
-        "symlink_escape" | "symlink_cycle" | "path_rejected" | "timestamp_rejected" => {
-            let issue = match stored.event_kind.as_str() {
-                "symlink_escape" => CollectionIssue::SymlinkEscape,
-                "symlink_cycle" => CollectionIssue::SymlinkCycle,
-                "path_rejected" => CollectionIssue::PathRejected,
-                "timestamp_rejected" => CollectionIssue::TimestampRejected,
-                _ => unreachable!(),
-            };
-            Ok(OperationalEvent::CollectionWarning {
-                collection: required(stored.collection, "collection log name is missing")?,
-                path: stored
-                    .path
-                    .map(|path| ProtocolPath::parse(&path))
-                    .transpose()?,
-                issue,
-            })
-        }
-        "record_accepted" => Ok(OperationalEvent::RecordAccepted {
-            collection: required(stored.collection, "record log collection is missing")?,
-            path: ProtocolPath::parse(&required(stored.path, "record log path is missing")?)?,
-            source_peer: peer_endpoint,
-        }),
-        "record_rejected" => Ok(OperationalEvent::RecordRejected {
-            collection: required(stored.collection, "record log collection is missing")?,
-            path: ProtocolPath::parse(&required(stored.path, "record log path is missing")?)?,
-            source_peer: peer_endpoint,
-            candidate_modified_ns: required(
-                stored.candidate_modified_ns,
-                "rejected record candidate timestamp is missing",
-            )?,
-            candidate_author: endpoint_from_blob(required(
-                stored.candidate_author,
-                "rejected record candidate author is missing",
-            )?)?,
-            winner_modified_ns: required(
-                stored.winner_modified_ns,
-                "rejected record winner timestamp is missing",
-            )?,
-            winner_author: endpoint_from_blob(required(
-                stored.winner_author,
-                "rejected record winner author is missing",
-            )?)?,
-        }),
-        "file_installed" | "file_apply_rejected" | "repair_required" => {
-            let collection = required(stored.collection, "file log collection is missing")?;
-            let path = ProtocolPath::parse(&required(stored.path, "file log path is missing")?)?;
-            Ok(match stored.event_kind.as_str() {
-                "file_installed" => OperationalEvent::FileInstalled { collection, path },
-                "file_apply_rejected" => OperationalEvent::FileApplyRejected { collection, path },
-                "repair_required" => OperationalEvent::RepairRequired { collection, path },
-                _ => unreachable!(),
-            })
-        }
-        "peer_unreachable" => Ok(OperationalEvent::PeerUnreachable {
-            peer_endpoint: required(peer_endpoint, "unreachable peer EndpointID is missing")?,
-        }),
-        "peer_attempted" | "peer_synchronized" | "peer_rejected" | "peer_session_failed" => {
-            let peer_endpoint = required(peer_endpoint, "peer event EndpointID is missing")?;
-            Ok(match stored.event_kind.as_str() {
-                "peer_attempted" => OperationalEvent::PeerAttempted { peer_endpoint },
-                "peer_synchronized" => OperationalEvent::PeerSynchronized { peer_endpoint },
-                "peer_rejected" => OperationalEvent::PeerRejected { peer_endpoint },
-                "peer_session_failed" => OperationalEvent::PeerSessionFailed { peer_endpoint },
-                _ => unreachable!(),
-            })
-        }
-        "file_sent" | "file_received" | "transfer_rejected" => {
-            let collection = required(stored.collection, "transfer collection is missing")?;
-            let path = ProtocolPath::parse(&required(stored.path, "transfer path is missing")?)?;
-            let peer_endpoint = required(peer_endpoint, "transfer peer EndpointID is missing")?;
-            Ok(match stored.event_kind.as_str() {
-                "file_sent" => OperationalEvent::FileSent {
-                    collection,
-                    path,
-                    peer_endpoint,
-                },
-                "file_received" => OperationalEvent::FileReceived {
-                    collection,
-                    path,
-                    peer_endpoint,
-                },
-                "transfer_rejected" => OperationalEvent::TransferRejected {
-                    collection,
-                    path,
-                    peer_endpoint,
-                },
-                _ => unreachable!(),
-            })
-        }
-        _ => Err(StateError::InvalidStoredState(
-            "operational event kind is unknown",
-        )),
+fn decode_operational_event(payload: &[u8]) -> Result<OperationalEvent, StateError> {
+    if payload.is_empty() || payload.len() > MAX_OPERATIONAL_EVENT_BYTES {
+        return Err(StateError::InvalidStoredState(
+            "operational event payload has an invalid size",
+        ));
     }
+    let event = serde_json::from_slice(payload)
+        .map_err(|_| StateError::InvalidStoredState("operational event payload is invalid"))?;
+    validate_operational_event(&event)?;
+    let canonical = serde_json::to_vec(&event)
+        .map_err(|_| StateError::InvalidStoredState("operational event payload is invalid"))?;
+    if canonical != payload {
+        return Err(StateError::InvalidStoredState(
+            "operational event payload is invalid",
+        ));
+    }
+    Ok(event)
 }
 
-fn required<T>(value: Option<T>, message: &'static str) -> Result<T, StateError> {
-    value.ok_or(StateError::InvalidStoredState(message))
-}
-
-fn endpoint_from_blob(bytes: Vec<u8>) -> Result<EndpointId, StateError> {
-    let bytes = bytes
-        .try_into()
-        .map_err(|_| StateError::InvalidStoredState("EndpointID has the wrong length"))?;
-    Ok(EndpointId::from_bytes(bytes))
+fn validate_operational_event(event: &OperationalEvent) -> Result<(), StateError> {
+    let (collection, path) = match event {
+        OperationalEvent::DaemonStarted
+        | OperationalEvent::DaemonStopped
+        | OperationalEvent::PeerUnreachable { .. }
+        | OperationalEvent::PeerAttempted { .. }
+        | OperationalEvent::PeerSynchronized { .. }
+        | OperationalEvent::PeerRejected { .. }
+        | OperationalEvent::PeerSessionFailed { .. } => (None, None),
+        OperationalEvent::CollectionAttached { collection }
+        | OperationalEvent::CollectionDetached { collection }
+        | OperationalEvent::CollectionPaused { collection }
+        | OperationalEvent::CollectionScanned { collection } => (Some(collection), None),
+        OperationalEvent::CollectionWarning {
+            collection, path, ..
+        } => (Some(collection), path.as_ref()),
+        OperationalEvent::RecordAccepted {
+            collection, path, ..
+        }
+        | OperationalEvent::RecordRejected {
+            collection, path, ..
+        }
+        | OperationalEvent::FileInstalled { collection, path }
+        | OperationalEvent::FileApplyRejected { collection, path }
+        | OperationalEvent::RepairRequired { collection, path }
+        | OperationalEvent::FileSent {
+            collection, path, ..
+        }
+        | OperationalEvent::FileReceived {
+            collection, path, ..
+        }
+        | OperationalEvent::TransferRejected {
+            collection, path, ..
+        } => (Some(collection), Some(path)),
+    };
+    if collection.is_some_and(|value| value.is_empty() || value.len() > 255) {
+        return Err(StateError::InvalidStoredState(
+            "operational event collection has an invalid size",
+        ));
+    }
+    if path.is_some_and(|value| value.as_str().len() > 4_096) {
+        return Err(StateError::InvalidStoredState(
+            "operational event path exceeds its size limit",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Error)]
@@ -2290,34 +1793,6 @@ mod tests {
     }
 
     #[test]
-    fn version_five_logs_upgrade_and_accept_typed_session_failures() {
-        let temporary = tempfile::tempdir().unwrap();
-        let database = temporary.path().join("state.sqlite3");
-        {
-            let mut store = StateStore::open(&database).unwrap();
-            store
-                .append_log(1, &OperationalEvent::StateOpened, 10)
-                .unwrap();
-            store
-                .connection
-                .pragma_update(None, "user_version", 5)
-                .unwrap();
-        }
-
-        let mut store = StateStore::open(&database).unwrap();
-        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
-        assert_eq!(
-            store.logs().unwrap()[0].event,
-            OperationalEvent::StateOpened
-        );
-        let event = OperationalEvent::PeerSessionFailed {
-            peer_endpoint: EndpointId::from_bytes([7; 32]),
-        };
-        store.append_log(2, &event, 10).unwrap();
-        assert_eq!(store.logs().unwrap()[1].event, event);
-    }
-
-    #[test]
     fn logical_write_rolls_back_when_log_insert_fails() {
         let mut store = StateStore::open_in_memory().unwrap();
         store
@@ -2376,6 +1851,9 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
+        let application_id: i64 = connection
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
         let roster_tables: i64 = connection
             .query_row(
                 "SELECT count(*) FROM sqlite_master
@@ -2385,7 +1863,63 @@ mod tests {
             )
             .unwrap();
         assert_eq!(version, 0);
+        assert_eq!(application_id, 0);
         assert_eq!(roster_tables, 0);
+    }
+
+    #[test]
+    fn current_version_with_an_arbitrary_shape_is_rejected() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "application_id", SCHEMA_APPLICATION_ID)
+            .unwrap();
+        connection
+            .execute_batch("CREATE TABLE arbitrary (value TEXT); PRAGMA user_version = 1;")
+            .unwrap();
+        assert!(matches!(
+            StateStore::from_connection(connection),
+            Err(StateError::InvalidStoredState(
+                "database table shape is not recognized"
+            ))
+        ));
+    }
+
+    #[test]
+    fn former_version_one_shape_is_rejected_without_compatibility_conversion() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE identity_refs (
+                    slot TEXT PRIMARY KEY NOT NULL,
+                    backend TEXT NOT NULL,
+                    locator BLOB NOT NULL
+                 );
+                 CREATE TABLE operational_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_ns INTEGER NOT NULL,
+                    event_kind TEXT NOT NULL
+                 );
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        assert!(matches!(
+            StateStore::from_connection(connection),
+            Err(StateError::InvalidStoredState(
+                "database schema identity is not recognized"
+            ))
+        ));
+    }
+
+    #[test]
+    fn future_schema_is_rejected_without_changes() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        assert!(matches!(
+            StateStore::from_connection(connection),
+            Err(StateError::UnsupportedSchema(version)) if version == SCHEMA_VERSION + 1
+        ));
     }
 
     #[test]
@@ -2509,18 +2043,71 @@ mod tests {
             RosterRevision::genesis(GroupId::from_bytes([3; 32]), "creator", &creator).unwrap();
         let mut canonical = genesis.canonical_bytes();
         *canonical.last_mut().unwrap() ^= 1;
-        let tampered = RosterRevision::from_canonical(&canonical).unwrap();
+        assert!(RosterRevision::from_canonical(&canonical).is_ok());
         let store = StateStore::open_in_memory().unwrap();
         store
             .connection
             .execute(
-                "INSERT INTO roster_revisions
-                    (hash, revision_number, parent_hash, canonical)
-                 VALUES (?1, 0, NULL, ?2)",
-                params![tampered.canonical_hash().as_bytes(), canonical],
+                "INSERT INTO roster_revisions (hash, canonical) VALUES (?1, ?2)",
+                params![genesis.canonical_hash().as_bytes(), canonical],
             )
             .unwrap();
         assert!(store.selected_roster_chain().is_err());
+    }
+
+    #[test]
+    fn record_read_rejects_canonical_bytes_with_a_different_hash() {
+        let mut store = StateStore::open_in_memory().unwrap();
+        store
+            .add_collection(".agents", Path::new("/skills"), None)
+            .unwrap();
+        let record = sample_record(10, 7);
+        let other = sample_record(11, 8);
+        store.merge_record(&record, 10, None, 100).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE path_records SET canonical = ?3
+                 WHERE collection = ?1 AND path = ?2",
+                params![".agents", "review/SKILL.md", other.canonical_bytes()],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.record(".agents", "review/SKILL.md"),
+            Err(StateError::InvalidStoredState(
+                "record hash does not match canonical bytes"
+            ))
+        ));
+    }
+
+    #[test]
+    fn record_read_rejects_an_index_that_disagrees_with_canonical_identity() {
+        let mut store = StateStore::open_in_memory().unwrap();
+        store
+            .add_collection(".agents", Path::new("/skills"), None)
+            .unwrap();
+        let record = sample_record(10, 7);
+        store.merge_record(&record, 10, None, 100).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE path_records SET path = 'other/SKILL.md'
+                 WHERE collection = '.agents' AND path = 'review/SKILL.md'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.record(".agents", "other/SKILL.md"),
+            Err(StateError::InvalidStoredState(
+                "record index does not match canonical bytes"
+            ))
+        ));
+        assert!(matches!(
+            store.records(".agents"),
+            Err(StateError::InvalidStoredState(
+                "record index does not match canonical bytes"
+            ))
+        ));
     }
 
     #[test]
@@ -2531,12 +2118,8 @@ mod tests {
         let roster =
             RosterRevision::genesis(GroupId::from_bytes([2; 32]), "creator", &creator).unwrap();
         let record = sample_record(10, 7);
-        let reference = IdentityReference::File {
-            path: temporary.path().join("identity.key"),
-        };
         {
             let mut store = StateStore::open(&database).unwrap();
-            store.save_identity_reference("device", &reference).unwrap();
             store
                 .add_collection(".agents", Path::new("/skills"), Some(Path::new("/real")))
                 .unwrap();
@@ -2550,10 +2133,6 @@ mod tests {
         }
 
         let reopened = StateStore::open(&database).unwrap();
-        assert_eq!(
-            reopened.identity_reference("device").unwrap(),
-            Some(reference)
-        );
         assert_eq!(
             reopened.collection(".agents").unwrap(),
             Some(CollectionState {
@@ -2596,7 +2175,7 @@ mod tests {
         let mut store = StateStore::open_in_memory().unwrap();
         for index in 0..5 {
             store
-                .append_log(index, &OperationalEvent::StateOpened, 3)
+                .append_log(index, &OperationalEvent::DaemonStarted, 3)
                 .unwrap();
         }
         let logs = store.logs().unwrap();
@@ -2610,7 +2189,7 @@ mod tests {
         let mut store = StateStore::open_in_memory().unwrap();
         for index in 0..10 {
             store
-                .append_log(index, &OperationalEvent::StateOpened, 3)
+                .append_log(index, &OperationalEvent::DaemonStarted, 3)
                 .unwrap();
         }
         let first = store.logs_page(0, 2).unwrap();
@@ -2628,7 +2207,7 @@ mod tests {
         assert!(!second.has_more);
 
         store
-            .append_log(10, &OperationalEvent::StateOpened, 3)
+            .append_log(10, &OperationalEvent::DaemonStarted, 3)
             .unwrap();
         let followed = store.logs_page(second.next_after_id, 64).unwrap();
         assert_eq!(followed.logs[0].id, 11);
@@ -2684,11 +2263,19 @@ mod tests {
 
         store
             .connection
+            .pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
+        store
+            .connection
             .execute(
                 "UPDATE path_records SET materialized_hash = ?3
                  WHERE collection = ?1 AND path = ?2",
                 params![".agents", "review/SKILL.md", vec![1_u8]],
             )
+            .unwrap();
+        store
+            .connection
+            .pragma_update(None, "ignore_check_constraints", false)
             .unwrap();
         assert!(matches!(
             store.record_state(".agents", "review/SKILL.md"),
@@ -2830,6 +2417,83 @@ mod tests {
     }
 
     #[test]
+    fn operational_log_rejects_corrupt_unknown_and_oversized_payloads() {
+        let store = StateStore::open_in_memory().unwrap();
+        for payload in [
+            b"{".to_vec(),
+            br#"{"event":"unknown"}"#.to_vec(),
+            br#"{"event":"daemon_started","body":"unexpected"}"#.to_vec(),
+        ] {
+            store
+                .connection
+                .execute("DELETE FROM operational_logs", [])
+                .unwrap();
+            store
+                .connection
+                .execute(
+                    "INSERT INTO operational_logs (created_ns, payload) VALUES (1, ?1)",
+                    [payload],
+                )
+                .unwrap();
+            let error = store.logs().unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    StateError::InvalidStoredState("operational event payload is invalid")
+                ),
+                "{error:?}"
+            );
+        }
+
+        let oversized = i64::try_from(MAX_OPERATIONAL_EVENT_BYTES + 1).unwrap();
+        assert!(
+            store
+                .connection
+                .execute(
+                    "INSERT INTO operational_logs (created_ns, payload)
+                     VALUES (1, zeroblob(?1))",
+                    [oversized],
+                )
+                .is_err()
+        );
+        store
+            .connection
+            .pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
+        for insert in [
+            "INSERT INTO operational_logs (created_ns, payload) VALUES (1, '{}')",
+            "INSERT INTO operational_logs (created_ns, payload) VALUES (1, X'')",
+            "INSERT INTO operational_logs (created_ns, payload)
+             VALUES (1, zeroblob(16385))",
+        ] {
+            store
+                .connection
+                .execute("DELETE FROM operational_logs", [])
+                .unwrap();
+            store.connection.execute(insert, []).unwrap();
+            let errors = [
+                store.logs().map(|_| ()).unwrap_err(),
+                store.logs_page(0, 10).map(|_| ()).unwrap_err(),
+            ];
+            for error in errors {
+                assert!(
+                    matches!(
+                        error,
+                        StateError::InvalidStoredState(
+                            "operational event payload has invalid storage"
+                        )
+                    ),
+                    "{error:?}"
+                );
+            }
+        }
+        store
+            .connection
+            .pragma_update(None, "ignore_check_constraints", false)
+            .unwrap();
+    }
+
+    #[test]
     fn operational_log_api_and_debug_output_exclude_secrets() {
         let config = Config::from_toml(
             r#"
@@ -2849,6 +2513,9 @@ mod tests {
             )
             .unwrap();
         let debug = format!("{config:?} {:?}", store.logs().unwrap());
+        let cli_json = crate::daemon::logs_page_value(&store, 0, 10)
+            .unwrap()
+            .to_string();
         for secret in [
             "private-auth-value",
             "funny-capybara",
@@ -2858,18 +2525,17 @@ mod tests {
             "skill-file-contents",
         ] {
             assert!(!debug.contains(secret));
+            assert!(!cli_json.contains(secret));
         }
-        let stored_text: String = store
+        let stored_bytes: Vec<u8> = store
             .connection
-            .query_row(
-                "SELECT group_concat(
-                    event_kind || coalesce(collection, '') || coalesce(path, ''), '|'
-                 ) FROM operational_logs",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT payload FROM operational_logs", [], |row| row.get(0))
             .unwrap();
-        assert!(!stored_text.contains(config.joining.headers["Authorization"].expose()));
+        assert!(
+            !String::from_utf8(stored_bytes)
+                .unwrap()
+                .contains(config.joining.headers["Authorization"].expose())
+        );
     }
 
     #[test]
