@@ -148,6 +148,24 @@ fn setup_daemon_watch_repair_and_local_cli_work_across_processes() {
     assert!(!shown.contains("secret-value"));
     assert!(shown.contains("[redacted]"));
     toml::from_str::<toml::Value>(&shown).unwrap();
+    let shown_json = command(root)
+        .env(
+            "SKILLSYNC_JOINING_SERVICE_URL",
+            "https://environment.example.test",
+        )
+        .args(["config", "show", "--json"])
+        .output()
+        .unwrap();
+    assert!(shown_json.status.success());
+    let shown_json: Value = serde_json::from_slice(&shown_json.stdout).unwrap();
+    assert_eq!(
+        shown_json["joining"]["service_url"],
+        "https://environment.example.test"
+    );
+    assert_eq!(
+        shown_json["joining"]["headers"]["Authorization"],
+        "[redacted]"
+    );
 
     fs::create_dir_all(&platform_paths.runtime_dir).unwrap();
     let stale = UnixListener::bind(skillsync::daemon::socket_path(&platform_paths)).unwrap();

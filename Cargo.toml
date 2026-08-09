@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/skillsync", "crates/joining-service"]
+members = ["crates/skillsync"]
 resolver = "2"
 
 [workspace.package]

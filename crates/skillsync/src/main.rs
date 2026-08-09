@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
-use skillsync::config::{Config, IrohPreset, PlatformPaths};
+use skillsync::config::{Config, PlatformPaths};
 use skillsync::daemon::{
     ControlRequest, ControlResponse, DaemonError, attach_collection, collections_value,
     detach_collection, logs_page_value, peers_value, resolve_peer, send_request, status_value,
@@ -799,68 +799,11 @@ fn absolute_path(path: &Path) -> io::Result<PathBuf> {
 }
 
 fn config_json(config: &Config) -> Value {
-    json!({
-        "device": { "name": config.device.name },
-        "joining": {
-            "service_url": config.effective_joining_service_url(),
-            "invitation_ttl": humantime::format_duration(config.joining.invitation_ttl).to_string(),
-            "headers": config.joining.headers.keys().map(|key| (key.clone(), json!("[redacted]"))).collect::<serde_json::Map<_, _>>()
-        },
-        "iroh": {
-            "preset": match config.iroh.preset { IrohPreset::N0 => "n0", IrohPreset::Custom => "custom" },
-            "relay_urls": config.iroh.relay_urls,
-            "address_lookup_urls": config.iroh.address_lookup_urls
-        },
-        "sync": {
-            "interval": humantime::format_duration(config.sync.interval).to_string(),
-            "max_future_clock_skew": humantime::format_duration(config.sync.max_future_clock_skew).to_string(),
-            "ignore": config.sync.ignore
-        },
-        "logging": { "max_entries": config.logging.max_entries }
-    })
+    serde_json::to_value(config.effective()).expect("configuration always serializes")
 }
 
 fn config_toml(config: &Config) -> String {
-    let value = config_json(config);
-    let headers = value["joining"]["headers"]
-        .as_object()
-        .expect("headers is an object")
-        .iter()
-        .map(|(key, value)| format!("{key} = {}\n", toml_string(value.as_str().unwrap())))
-        .collect::<String>();
-    format!(
-        "[device]\nname = {}\n\n[joining]\nservice_url = {}\ninvitation_ttl = {}\n{}\n[iroh]\npreset = {}\nrelay_urls = {}\naddress_lookup_urls = {}\n\n[sync]\ninterval = {}\nmax_future_clock_skew = {}\nignore = {}\n\n[logging]\nmax_entries = {}\n",
-        toml_string(value["device"]["name"].as_str().unwrap()),
-        toml_string(value["joining"]["service_url"].as_str().unwrap()),
-        toml_string(value["joining"]["invitation_ttl"].as_str().unwrap()),
-        if headers.is_empty() {
-            String::new()
-        } else {
-            format!("\n[joining.headers]\n{headers}")
-        },
-        toml_string(value["iroh"]["preset"].as_str().unwrap()),
-        toml_array(value["iroh"]["relay_urls"].as_array().unwrap()),
-        toml_array(value["iroh"]["address_lookup_urls"].as_array().unwrap()),
-        toml_string(value["sync"]["interval"].as_str().unwrap()),
-        toml_string(value["sync"]["max_future_clock_skew"].as_str().unwrap()),
-        toml_array(value["sync"]["ignore"].as_array().unwrap()),
-        value["logging"]["max_entries"].as_u64().unwrap()
-    )
-}
-
-fn toml_string(value: &str) -> String {
-    format!("{value:?}")
-}
-
-fn toml_array(values: &[Value]) -> String {
-    format!(
-        "[{}]",
-        values
-            .iter()
-            .map(|value| toml_string(value.as_str().unwrap()))
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
+    toml::to_string_pretty(&config.effective()).expect("configuration always serializes")
 }
 
 fn print_json(value: &Value) {

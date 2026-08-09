@@ -5,12 +5,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize, Serializer};
 use thiserror::Error;
 
 const DEFAULT_JOINING_SERVICE: &str = "https://skillsync.danthegoodman.com";
 
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     pub device: DeviceConfig,
@@ -41,6 +41,12 @@ impl Config {
     pub fn effective_joining_service_url(&self) -> String {
         env::var("SKILLSYNC_JOINING_SERVICE_URL")
             .unwrap_or_else(|_| self.joining.service_url.clone())
+    }
+
+    pub fn effective(&self) -> Self {
+        let mut config = self.clone();
+        config.joining.service_url = self.effective_joining_service_url();
+        config
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -80,20 +86,7 @@ impl Config {
     }
 }
 
-impl fmt::Debug for Config {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("Config")
-            .field("device", &self.device)
-            .field("joining", &self.joining)
-            .field("iroh", &self.iroh)
-            .field("sync", &self.sync)
-            .field("logging", &self.logging)
-            .finish()
-    }
-}
-
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct DeviceConfig {
     pub name: String,
@@ -107,7 +100,7 @@ impl Default for DeviceConfig {
     }
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct JoiningConfig {
     pub service_url: String,
@@ -153,7 +146,16 @@ impl fmt::Debug for SecretValue {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+impl Serialize for SecretValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str("[redacted]")
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum IrohPreset {
     #[default]
@@ -161,7 +163,7 @@ pub enum IrohPreset {
     Custom,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct IrohConfig {
     pub preset: IrohPreset,
@@ -179,7 +181,7 @@ impl Default for IrohConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SyncConfig {
     #[serde(with = "humantime_serde")]
@@ -203,7 +205,7 @@ impl Default for SyncConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LoggingConfig {
     pub max_entries: usize,
@@ -343,7 +345,38 @@ mod tests {
         );
         let debug = format!("{config:?}");
         assert!(!debug.contains("private-token"));
+        assert!(!debug.contains("join.example.net"));
         assert!(debug.contains("[redacted]"));
+
+        let json = serde_json::to_string(&config).unwrap();
+        let json_value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            json_value["joining"]["headers"]["Authorization"],
+            "[redacted]"
+        );
+        assert_eq!(json_value["joining"]["invitation_ttl"], "15m");
+        assert_eq!(json_value["iroh"]["preset"], "custom");
+        assert_eq!(json_value["sync"]["interval"], "15m");
+        assert_eq!(json_value["sync"]["max_future_clock_skew"], "5m");
+
+        let toml = toml::to_string_pretty(&config).unwrap();
+        let toml_value: toml::Value = toml::from_str(&toml).unwrap();
+        assert_eq!(
+            toml_value["joining"]["headers"]["Authorization"].as_str(),
+            Some("[redacted]")
+        );
+        assert_eq!(
+            toml_value["joining"]["invitation_ttl"].as_str(),
+            Some("15m")
+        );
+        assert_eq!(toml_value["iroh"]["preset"].as_str(), Some("custom"));
+        assert_eq!(toml_value["sync"]["interval"].as_str(), Some("15m"));
+        assert_eq!(
+            toml_value["sync"]["max_future_clock_skew"].as_str(),
+            Some("5m")
+        );
+        assert!(!json.contains("private-token"));
+        assert!(!toml.contains("private-token"));
     }
 
     #[test]
@@ -392,6 +425,9 @@ mod tests {
             config.effective_joining_service_url(),
             "https://environment.example.test"
         );
+        let effective = config.effective();
+        let json = serde_json::to_string(&effective).unwrap();
+        let toml = toml::to_string_pretty(&effective).unwrap();
         // SAFETY: the same process-wide lock remains held while restoring the variable.
         unsafe {
             match previous {
@@ -399,6 +435,16 @@ mod tests {
                 None => env::remove_var("SKILLSYNC_JOINING_SERVICE_URL"),
             }
         }
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap()["joining"]["service_url"],
+            "https://environment.example.test"
+        );
+        assert_eq!(
+            toml::from_str::<toml::Value>(&toml).unwrap()["joining"]["service_url"].as_str(),
+            Some("https://environment.example.test")
+        );
+        assert!(!json.contains("config.example.test"));
+        assert!(!toml.contains("config.example.test"));
     }
 
     #[test]
