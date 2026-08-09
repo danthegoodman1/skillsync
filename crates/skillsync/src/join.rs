@@ -1141,6 +1141,14 @@ mod tests {
         assert!(coordinator.pending().unwrap().is_none());
         drop(send);
         drop(recv);
+        drop(connection);
+        joiner_endpoint.close().await;
+        // A fresh CLI retry binds a new endpoint with the persisted device key.
+        let joiner_endpoint = direct_endpoint(&joiner_identity).await;
+        assert_eq!(
+            endpoint_from_iroh(joiner_endpoint.id()),
+            joiner_identity.endpoint_id()
+        );
 
         coordinator
             .activate(SecretNonce::new([8; 32]), Duration::from_secs(60))
