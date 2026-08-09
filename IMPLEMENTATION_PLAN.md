@@ -262,8 +262,8 @@ Status ledger:
 | Complete | Work | P4.3: Implement the bounded joining-service HTTP client | The redirect-free client enforces URL, header, body, TTL, timeout, retry, idempotency, response, and redaction bounds. |
 | Complete | Work | P4.4: Implement invite, nonce proof, identity confirmation, and join | One persistent endpoint handles bounded join sessions with nonce proof, exact EndpointID approval, default rejection, and resumable delivery. |
 | Complete | Work | P4.5: Implement roster discovery through one member | A joiner receives the complete selected roster and peer hints, attaches defaults, and synchronizes immediately. |
-| Complete | Test | Phase 4 membership and joining test plan | 133 local tests cover roster branches, client failures, terminal safety, process locking, three-device joining, removal, and stale-peer refusal. |
-| In Progress | Gate | Phase 4 completion gate | Implementation and skeptical review are approved. Ubuntu and macOS CI are pending for the pushed phase commit. |
+| Complete | Test | Phase 4 membership and joining test plan | 139 local tests cover roster branches, client failures, terminal safety, process locking, three-device joining, removal, stale-peer refusal, and deterministic timeout behavior. |
+| Complete | Gate | Phase 4 completion gate | Implementation and skeptical review are approved. [CI run 31294512696](https://github.com/danthegoodman1/skillsync/actions/runs/31294512696) passed on Ubuntu and macOS. |
 
 ## Phase 5: TypeScript Joining Service
 
