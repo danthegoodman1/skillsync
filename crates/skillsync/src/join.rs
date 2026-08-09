@@ -309,6 +309,7 @@ async fn run_joiner_on_endpoint(
     let response: JoinResponse =
         read_json_waiting(&mut recv, JOIN_RESPONSE_LIMIT, MAX_INVITATION_LIFETIME).await?;
     if !response.approved {
+        expect_stream_end(&mut recv).await?;
         return Err(JoinError::Rejected);
     }
     let roster = decode_roster(&response.roster)?;
@@ -348,11 +349,11 @@ async fn run_joiner_on_endpoint(
     )?;
     write_json(&mut send, &JoinAck { accepted: true }, JOIN_REQUEST_LIMIT).await?;
     send.finish().map_err(|_| JoinError::Transport)?;
-    wait_for_ack_delivery(send.stopped()).await?;
+    expect_stream_end(&mut recv).await?;
     Ok(inviter)
 }
 
-async fn wait_for_ack_delivery<F, S, E>(stopped: F) -> Result<(), JoinError>
+async fn wait_for_stream_delivery<F, S, E>(stopped: F) -> Result<(), JoinError>
 where
     F: Future<Output = Result<Option<S>, E>>,
 {
@@ -415,14 +416,24 @@ pub async fn run_inviter(
         }
     };
     write_json(&mut send, &response, JOIN_RESPONSE_LIMIT).await?;
-    send.finish().map_err(|_| JoinError::Transport)?;
     if !response.approved {
+        send.finish().map_err(|_| JoinError::Transport)?;
         return Err(JoinError::Rejected);
     }
-    let ack: JoinAck = read_json(&mut recv, JOIN_REQUEST_LIMIT).await?;
-    if !ack.accepted {
-        return Err(JoinError::InvalidFrame);
+    let ack_result = async {
+        let ack: JoinAck = read_json(&mut recv, JOIN_REQUEST_LIMIT).await?;
+        if !ack.accepted {
+            return Err(JoinError::InvalidFrame);
+        }
+        expect_stream_end(&mut recv).await
     }
+    .await;
+    if let Err(error) = ack_result {
+        let _ = send.reset(1_u32.into());
+        return Err(error);
+    }
+    send.finish().map_err(|_| JoinError::Transport)?;
+    let _ = wait_for_stream_delivery(send.stopped()).await;
     Ok(remote_endpoint)
 }
 
@@ -600,6 +611,22 @@ where
             .map_err(|_| JoinError::Transport)?;
     }
     serde_json::from_slice(&bytes).map_err(|_| JoinError::InvalidFrame)
+}
+
+async fn expect_stream_end<R>(stream: &mut R) -> Result<(), JoinError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut trailing = [0_u8; 1];
+    let read = tokio::time::timeout(JOIN_IO_TIMEOUT, stream.read(&mut trailing))
+        .await
+        .map_err(|_| JoinError::Timeout)?
+        .map_err(|_| JoinError::Transport)?;
+    if read == 0 {
+        Ok(())
+    } else {
+        Err(JoinError::InvalidFrame)
+    }
 }
 
 pub fn validate_join_device_name(device_name: &str) -> Result<(), JoinError> {
@@ -884,6 +911,32 @@ mod tests {
         assert!(matches!(stalled.await.unwrap(), Err(JoinError::Timeout)));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn join_stream_end_is_bounded_and_rejects_trailing_bytes() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut writer, mut reader) = tokio::io::duplex(8);
+        let waiting = tokio::spawn(async move { expect_stream_end(&mut reader).await });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        writer.shutdown().await.unwrap();
+        waiting.await.unwrap().unwrap();
+
+        let (mut writer, mut reader) = tokio::io::duplex(8);
+        writer.write_all(b"x").await.unwrap();
+        writer.shutdown().await.unwrap();
+        assert!(matches!(
+            expect_stream_end(&mut reader).await,
+            Err(JoinError::InvalidFrame)
+        ));
+
+        let (_writer, mut reader) = tokio::io::duplex(8);
+        let timed_out = tokio::spawn(async move { expect_stream_end(&mut reader).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(JOIN_IO_TIMEOUT + Duration::from_secs(1)).await;
+        assert!(matches!(timed_out.await.unwrap(), Err(JoinError::Timeout)));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn authenticated_join_installs_the_complete_signed_roster_and_hints() {
         let _guard = crate::network::IROH_TEST_LOCK.lock().await;
@@ -970,27 +1023,118 @@ mod tests {
         inviter_endpoint.close().await;
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn ack_delivery_wait_is_bounded_and_requires_transport_confirmation() {
-        let (confirm, confirmation) = oneshot::channel::<Result<Option<()>, ()>>();
-        let waiting = tokio::spawn(wait_for_ack_delivery(
-            async move { confirmation.await.unwrap() },
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invalid_ack_resets_the_approval_stream() {
+        let _guard = crate::network::IROH_TEST_LOCK.lock().await;
+        let inviter_identity = identity(13);
+        let joiner_identity = identity(14);
+        let inviter_endpoint = direct_endpoint(&inviter_identity).await;
+        let joiner_endpoint = direct_endpoint(&joiner_identity).await;
+        let coordinator = Arc::new(JoinCoordinator::default());
+        coordinator
+            .activate(SecretNonce::new([7; 32]), Duration::from_secs(60))
+            .unwrap();
+        let genesis =
+            RosterRevision::genesis(GroupId::from_bytes([6; 32]), "inviter", &inviter_identity)
+                .unwrap();
+        let admission = RosterRevision::child(
+            &genesis,
+            RosterChange::Admit(
+                RosterMember::new(joiner_identity.endpoint_id(), "joiner").unwrap(),
+            ),
+            &inviter_identity,
+        )
+        .unwrap();
+        let accepting_endpoint = inviter_endpoint.clone();
+        let accepting_coordinator = coordinator.clone();
+        let inviter_task = tokio::spawn(async move {
+            let incoming = accepting_endpoint.accept().await.unwrap();
+            let connection = incoming.accept().unwrap().await.unwrap();
+            run_inviter(connection, accepting_coordinator).await
+        });
+
+        let connection = joiner_endpoint
+            .connect(inviter_endpoint.addr(), JOIN_ALPN)
+            .await
+            .unwrap();
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        write_json(
+            &mut send,
+            &JoinRequest {
+                protocol: "skillsync/1".to_owned(),
+                nonce: [7; 32],
+                device_name: "joiner".to_owned(),
+                endpoint_addr_json: serde_json::to_string(&joiner_endpoint.addr()).unwrap(),
+            },
+            JOIN_REQUEST_LIMIT,
+        )
+        .await
+        .unwrap();
+        let pending = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(pending) = coordinator.pending().unwrap() {
+                    return pending;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let inviter_hint = serde_json::to_string(&inviter_endpoint.addr()).unwrap();
+        coordinator
+            .decide(
+                &pending.request_id,
+                JoinDecision::approved(
+                    vec![genesis, admission],
+                    BTreeMap::from([(
+                        inviter_identity.endpoint_id().to_string(),
+                        vec![inviter_hint],
+                    )]),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let response: JoinResponse = read_json(&mut recv, JOIN_RESPONSE_LIMIT).await.unwrap();
+        assert!(response.approved);
+        write_json(&mut send, &JoinAck { accepted: true }, JOIN_REQUEST_LIMIT)
+            .await
+            .unwrap();
+        send.write_all(b"trailing").await.unwrap();
+        send.finish().unwrap();
+
+        assert!(matches!(
+            inviter_task.await.unwrap(),
+            Err(JoinError::InvalidFrame)
         ));
+        assert!(matches!(
+            expect_stream_end(&mut recv).await,
+            Err(JoinError::Transport)
+        ));
+        joiner_endpoint.close().await;
+        inviter_endpoint.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_delivery_wait_is_bounded_and_requires_transport_confirmation() {
+        let (confirm, confirmation) = oneshot::channel::<Result<Option<()>, ()>>();
+        let waiting = tokio::spawn(wait_for_stream_delivery(async move {
+            confirmation.await.unwrap()
+        }));
         tokio::task::yield_now().await;
         assert!(!waiting.is_finished());
         confirm.send(Ok(None)).unwrap();
         waiting.await.unwrap().unwrap();
 
         assert!(matches!(
-            wait_for_ack_delivery(async { Ok::<_, ()>(Some(())) }).await,
+            wait_for_stream_delivery(async { Ok::<_, ()>(Some(())) }).await,
             Err(JoinError::Transport)
         ));
         assert!(matches!(
-            wait_for_ack_delivery(async { Err::<Option<()>, _>(()) }).await,
+            wait_for_stream_delivery(async { Err::<Option<()>, _>(()) }).await,
             Err(JoinError::Transport)
         ));
 
-        let timed_out = tokio::spawn(wait_for_ack_delivery(std::future::pending::<
+        let timed_out = tokio::spawn(wait_for_stream_delivery(std::future::pending::<
             Result<Option<()>, ()>,
         >()));
         tokio::task::yield_now().await;
