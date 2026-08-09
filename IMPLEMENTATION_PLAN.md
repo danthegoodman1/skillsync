@@ -208,7 +208,7 @@ Status ledger:
 | Complete | Work | P3.4: Implement reconciliation triggers and peer health reporting | Startup, local-change, explicit, and interval triggers are covered with bounded typed health logs. |
 | Complete | Work | P3.5: Implement degraded-path repair from a reachable winner | Repair-only scans request reconciliation and unavailable paths do not block transferable siblings. |
 | Complete | Test | Phase 3 peer synchronization test plan | 101 local tests cover direct and relay paths, online and offline convergence, restart, repair, corruption, interruption, limits, and daemon responsiveness. |
-| In Progress | Gate | Phase 3 completion gate | Implementation and skeptical review are approved. Ubuntu and macOS CI are pending for the pushed phase commit. |
+| Complete | Gate | Phase 3 completion gate | Implementation and skeptical review are approved. [CI run 31286777773](https://github.com/danthegoodman1/skillsync/actions/runs/31286777773) passed on Ubuntu and macOS. |
 
 ## Phase 4: Membership and Human Joining
 
