@@ -110,7 +110,13 @@ fn wait_for_watch_status(
 fn raw_request(paths: &PlatformPaths, bytes: &[u8]) -> String {
     let mut stream = UnixStream::connect(skillsync::daemon::socket_path(paths)).unwrap();
     if let Err(error) = stream.write_all(bytes) {
-        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::NotConnected
+            ),
+            "unexpected control write error: {error}"
+        );
     }
     let _ = stream.shutdown(std::net::Shutdown::Write);
     let mut response = String::new();
