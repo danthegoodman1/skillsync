@@ -11,14 +11,13 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use thiserror::Error;
 
 use crate::identity::EndpointId;
-use crate::installer::DiskFingerprint;
 use crate::path::{FilenameComparison, LocalPathIndex, PathError, ProtocolPath};
 use crate::record::{Record, RecordKind};
 use crate::root::{StableRoot, StableRootError, open_stable_root_with_hook};
 use crate::setup::now_ns;
 use crate::state::{
-    CollectionIssue, CollectionScanStatus, CollectionState, OperationalEvent, StateError,
-    StateStore,
+    CollectionIssue, CollectionScanStatus, CollectionState, FileFingerprint, OperationalEvent,
+    StateError, StateStore,
 };
 
 const INTERNAL_PREFIX: &str = ".skillsync-tmp-";
@@ -228,12 +227,12 @@ impl Scanner {
                 let fingerprint = disk.fingerprint();
                 let durable_match = materialized_fingerprints
                     .get(path.as_str())
-                    .is_some_and(|stored| *stored == fingerprint.into());
+                    .is_some_and(|stored| *stored == fingerprint);
                 if durable_match || disk_matches_record(disk, &winner) {
                     state.set_materialized_fingerprint(
                         &collection.name,
                         path.as_str(),
-                        fingerprint.into(),
+                        fingerprint,
                     )?;
                     continue;
                 }
@@ -321,8 +320,8 @@ struct DiskFile {
 }
 
 impl DiskFile {
-    fn fingerprint(&self) -> DiskFingerprint {
-        DiskFingerprint {
+    fn fingerprint(&self) -> FileFingerprint {
+        FileFingerprint {
             modified_ns: self.modified_ns,
             size: self.size,
             hash: self.hash,
@@ -1379,7 +1378,7 @@ mod tests {
         let rounded_fingerprint = {
             use std::os::unix::fs::MetadataExt as _;
 
-            DiskFingerprint {
+            FileFingerprint {
                 modified_ns: metadata
                     .mtime()
                     .saturating_mul(1_000_000_000)
@@ -1390,7 +1389,7 @@ mod tests {
         };
         assert_ne!(rounded_fingerprint.modified_ns, record.modified_ns());
         store
-            .set_materialized_fingerprint("team", "SKILL.md", rounded_fingerprint.into())
+            .set_materialized_fingerprint("team", "SKILL.md", rounded_fingerprint)
             .unwrap();
         let expired_scanner = scanner();
         let attached = store.collection("team").unwrap().unwrap();

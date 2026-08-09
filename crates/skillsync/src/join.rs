@@ -65,22 +65,17 @@ pub struct PendingJoinInfo {
     pub device_name: String,
 }
 
+#[derive(Default)]
 pub struct JoinCoordinator {
     inner: Mutex<JoinState>,
 }
 
-impl Default for JoinCoordinator {
-    fn default() -> Self {
-        Self {
-            inner: Mutex::new(JoinState::default()),
-        }
-    }
-}
-
 #[derive(Default)]
-struct JoinState {
-    active: Option<ActiveInvitation>,
-    pending: Option<PendingJoin>,
+enum JoinState {
+    #[default]
+    Idle,
+    Active(ActiveInvitation),
+    Pending(PendingJoin),
 }
 
 struct ActiveInvitation {
@@ -91,7 +86,7 @@ struct ActiveInvitation {
 struct PendingJoin {
     info: PendingJoinInfo,
     endpoint_addr_json: String,
-    decision: Option<oneshot::Sender<JoinDecision>>,
+    decision: oneshot::Sender<JoinDecision>,
     deadline: Instant,
 }
 
@@ -131,10 +126,10 @@ impl JoinCoordinator {
         }
         let mut state = self.inner.lock().map_err(|_| JoinError::Coordinator)?;
         expire_locked(&mut state);
-        if state.active.is_some() || state.pending.is_some() {
+        if !matches!(*state, JoinState::Idle) {
             return Err(JoinError::InvitationBusy);
         }
-        state.active = Some(ActiveInvitation {
+        *state = JoinState::Active(ActiveInvitation {
             nonce,
             deadline: Instant::now() + lifetime,
         });
@@ -144,43 +139,50 @@ impl JoinCoordinator {
     pub fn pending(&self) -> Result<Option<PendingJoinInfo>, JoinError> {
         let mut state = self.inner.lock().map_err(|_| JoinError::Coordinator)?;
         expire_locked(&mut state);
-        Ok(state.pending.as_ref().map(|pending| pending.info.clone()))
+        Ok(match &*state {
+            JoinState::Pending(pending) => Some(pending.info.clone()),
+            JoinState::Idle | JoinState::Active(_) => None,
+        })
     }
 
     pub fn pending_addr(&self, request_id: &str) -> Result<(PendingJoinInfo, String), JoinError> {
         let mut state = self.inner.lock().map_err(|_| JoinError::Coordinator)?;
         expire_locked(&mut state);
-        let pending = state
-            .pending
-            .as_ref()
-            .filter(|pending| pending.info.request_id == request_id)
-            .ok_or(JoinError::UnknownJoinRequest)?;
+        let JoinState::Pending(pending) = &*state else {
+            return Err(JoinError::UnknownJoinRequest);
+        };
+        if pending.info.request_id != request_id {
+            return Err(JoinError::UnknownJoinRequest);
+        }
         Ok((pending.info.clone(), pending.endpoint_addr_json.clone()))
     }
 
     pub fn decide(&self, request_id: &str, decision: JoinDecision) -> Result<(), JoinError> {
         let mut state = self.inner.lock().map_err(|_| JoinError::Coordinator)?;
         expire_locked(&mut state);
-        let mut pending = state
-            .pending
-            .take()
-            .filter(|pending| pending.info.request_id == request_id)
-            .ok_or(JoinError::UnknownJoinRequest)?;
-        let sender = pending
+        let JoinState::Pending(pending) = &*state else {
+            return Err(JoinError::UnknownJoinRequest);
+        };
+        if pending.info.request_id != request_id {
+            return Err(JoinError::UnknownJoinRequest);
+        }
+        let JoinState::Pending(pending) = std::mem::replace(&mut *state, JoinState::Idle) else {
+            unreachable!("pending join checked above")
+        };
+        pending
             .decision
-            .take()
-            .ok_or(JoinError::UnknownJoinRequest)?;
-        sender.send(decision).map_err(|_| JoinError::JoinerGone)
+            .send(decision)
+            .map_err(|_| JoinError::JoinerGone)
     }
 
     fn cancel(&self, request_id: &str) {
         if let Ok(mut state) = self.inner.lock()
-            && state
-                .pending
-                .as_ref()
-                .is_some_and(|pending| pending.info.request_id == request_id)
+            && matches!(
+                &*state,
+                JoinState::Pending(pending) if pending.info.request_id == request_id
+            )
         {
-            state.pending = None;
+            *state = JoinState::Idle;
         }
     }
 
@@ -195,16 +197,11 @@ impl JoinCoordinator {
         validate_endpoint_addr(&endpoint_addr_json, remote_endpoint)?;
         let mut state = self.inner.lock().map_err(|_| JoinError::Coordinator)?;
         expire_locked(&mut state);
-        let invitation = state
-            .active
-            .take()
-            .ok_or(JoinError::InvitationUnavailable)?;
-        if !invitation.nonce.matches(nonce) {
-            state.active = Some(invitation);
+        let JoinState::Active(invitation) = &*state else {
             return Err(JoinError::InvitationUnavailable);
-        }
-        if state.pending.is_some() {
-            return Err(JoinError::InvitationBusy);
+        };
+        if !invitation.nonce.matches(nonce) {
+            return Err(JoinError::InvitationUnavailable);
         }
         let remaining = invitation
             .deadline
@@ -214,34 +211,29 @@ impl JoinCoordinator {
         }
         let (decision, receiver) = oneshot::channel();
         let request_id = Uuid::new_v4().to_string();
-        state.pending = Some(PendingJoin {
+        let deadline = invitation.deadline;
+        *state = JoinState::Pending(PendingJoin {
             info: PendingJoinInfo {
                 request_id: request_id.clone(),
                 endpoint_id: remote_endpoint,
                 device_name,
             },
             endpoint_addr_json,
-            decision: Some(decision),
-            deadline: invitation.deadline,
+            decision,
+            deadline,
         });
         Ok((receiver, remaining, request_id))
     }
 }
 
 fn expire_locked(state: &mut JoinState) {
-    if state
-        .active
-        .as_ref()
-        .is_some_and(|invitation| Instant::now() >= invitation.deadline)
-    {
-        state.active = None;
-    }
-    if state
-        .pending
-        .as_ref()
-        .is_some_and(|pending| Instant::now() >= pending.deadline)
-    {
-        state.pending = None;
+    let expired = match state {
+        JoinState::Idle => false,
+        JoinState::Active(invitation) => Instant::now() >= invitation.deadline,
+        JoinState::Pending(pending) => Instant::now() >= pending.deadline,
+    };
+    if expired {
+        *state = JoinState::Idle;
     }
 }
 
@@ -808,6 +800,10 @@ mod tests {
         coordinator
             .activate(SecretNonce::new([7; 32]), Duration::from_secs(60))
             .unwrap();
+        assert!(matches!(
+            coordinator.decide("stale", JoinDecision::rejected()),
+            Err(JoinError::UnknownJoinRequest)
+        ));
         let joiner = identity(2);
         assert!(matches!(
             coordinator.claim(
@@ -873,14 +869,12 @@ mod tests {
                 address(&joiner),
             )
             .unwrap();
-        coordinator
-            .inner
-            .lock()
-            .unwrap()
-            .pending
-            .as_mut()
-            .unwrap()
-            .deadline = Instant::now() - Duration::from_millis(1);
+        let mut state = coordinator.inner.lock().unwrap();
+        let JoinState::Pending(pending) = &mut *state else {
+            panic!("expected pending join")
+        };
+        pending.deadline = Instant::now() - Duration::from_millis(1);
+        drop(state);
         assert!(coordinator.pending().unwrap().is_none());
         coordinator
             .activate(SecretNonce::new([10; 32]), Duration::from_secs(60))

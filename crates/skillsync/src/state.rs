@@ -720,7 +720,7 @@ impl StateStore {
         &mut self,
         collection: &str,
         path: &str,
-        fingerprint: MaterializedFingerprint,
+        fingerprint: FileFingerprint,
     ) -> Result<(), StateError> {
         let transaction = self
             .connection
@@ -1150,11 +1150,11 @@ pub struct PathRecordState {
     pub record: Record,
     pub materialized: bool,
     pub needs_repair: bool,
-    pub materialized_fingerprint: Option<MaterializedFingerprint>,
+    pub materialized_fingerprint: Option<FileFingerprint>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MaterializedFingerprint {
+pub struct FileFingerprint {
     pub modified_ns: i64,
     pub size: u64,
     pub hash: [u8; 32],
@@ -1163,7 +1163,7 @@ pub struct MaterializedFingerprint {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MaterializedFile<'a> {
     pub resolved_root: &'a Path,
-    pub fingerprint: MaterializedFingerprint,
+    pub fingerprint: FileFingerprint,
 }
 
 fn decode_collection(
@@ -1403,13 +1403,11 @@ fn upsert_record(
     let materialized_fingerprint = if materialized {
         match record.kind() {
             crate::record::RecordKind::Tombstone => None,
-            crate::record::RecordKind::File { size, content_hash } => {
-                Some(MaterializedFingerprint {
-                    modified_ns: record.modified_ns(),
-                    size,
-                    hash: content_hash,
-                })
-            }
+            crate::record::RecordKind::File { size, content_hash } => Some(FileFingerprint {
+                modified_ns: record.modified_ns(),
+                size,
+                hash: content_hash,
+            }),
         }
     } else {
         None
@@ -1451,7 +1449,7 @@ fn update_materialized_fingerprint(
     transaction: &Transaction<'_>,
     collection: &str,
     path: &str,
-    fingerprint: MaterializedFingerprint,
+    fingerprint: FileFingerprint,
 ) -> Result<(), StateError> {
     let size = i64::try_from(fingerprint.size).map_err(|_| StateError::NumberOverflow)?;
     let updated = transaction.execute(
@@ -1479,10 +1477,10 @@ fn decode_materialized_fingerprint(
     modified_ns: Option<i64>,
     size: Option<i64>,
     hash: Option<Vec<u8>>,
-) -> Result<Option<MaterializedFingerprint>, StateError> {
+) -> Result<Option<FileFingerprint>, StateError> {
     match (modified_ns, size, hash) {
         (None, None, None) => Ok(None),
-        (Some(modified_ns), Some(size), Some(hash)) => Ok(Some(MaterializedFingerprint {
+        (Some(modified_ns), Some(size), Some(hash)) => Ok(Some(FileFingerprint {
             modified_ns,
             size: u64::try_from(size).map_err(|_| {
                 StateError::InvalidStoredState("materialized file size is negative")
@@ -2210,12 +2208,12 @@ mod tests {
         store
             .merge_record(&record, 10, Some(record.author()), 100)
             .unwrap();
-        let first = MaterializedFingerprint {
+        let first = FileFingerprint {
             modified_ns: 9,
             size: 5,
             hash: [7; 32],
         };
-        let second = MaterializedFingerprint {
+        let second = FileFingerprint {
             modified_ns: 8,
             size: 5,
             hash: [7; 32],
@@ -2298,12 +2296,12 @@ mod tests {
         store
             .merge_record(&second, 11, Some(second.author()), 100)
             .unwrap();
-        let first_fingerprint = MaterializedFingerprint {
+        let first_fingerprint = FileFingerprint {
             modified_ns: 10,
             size: 5,
             hash: [7; 32],
         };
-        let second_fingerprint = MaterializedFingerprint {
+        let second_fingerprint = FileFingerprint {
             modified_ns: 11,
             size: 5,
             hash: [8; 32],
@@ -2363,7 +2361,7 @@ mod tests {
         store
             .merge_record(&record, 10, Some(record.author()), 100)
             .unwrap();
-        let fingerprint = MaterializedFingerprint {
+        let fingerprint = FileFingerprint {
             modified_ns: 10,
             size: 5,
             hash: [7; 32],

@@ -10,9 +10,7 @@ use thiserror::Error;
 use crate::record::{Record, RecordKind};
 use crate::root::{StableRoot, StableRootError, open_stable_root_with_hook};
 use crate::setup::now_ns;
-use crate::state::{
-    MaterializedFile, MaterializedFingerprint, OperationalEvent, StateError, StateStore,
-};
+use crate::state::{FileFingerprint, MaterializedFile, OperationalEvent, StateError, StateStore};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InstallStage {
@@ -26,28 +24,11 @@ pub enum InstallStage {
     AfterRename,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DiskFingerprint {
-    pub modified_ns: i64,
-    pub size: u64,
-    pub hash: [u8; 32],
-}
-
-impl From<DiskFingerprint> for MaterializedFingerprint {
-    fn from(value: DiskFingerprint) -> Self {
-        Self {
-            modified_ns: value.modified_ns,
-            size: value.size,
-            hash: value.hash,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstalledFile {
     pub path: PathBuf,
     pub resolved_root: PathBuf,
-    pub fingerprint: DiskFingerprint,
+    pub fingerprint: FileFingerprint,
 }
 
 pub fn install_file(
@@ -122,7 +103,7 @@ pub fn install_file_with_hook(
         hook(InstallStage::BeforeFileSync)?;
         temporary_file.sync_all()?;
         let metadata = temporary_file.metadata()?;
-        let fingerprint = DiskFingerprint {
+        let fingerprint = FileFingerprint {
             modified_ns: metadata_time_ns(&metadata),
             size: metadata.len(),
             hash: declared_hash,
@@ -267,7 +248,7 @@ fn apply_file_fixture_with_hook(
                     record.path().as_str(),
                     MaterializedFile {
                         resolved_root: &installed.resolved_root,
-                        fingerprint: installed.fingerprint.into(),
+                        fingerprint: installed.fingerprint,
                     },
                     now_ns(),
                     &event,
@@ -291,7 +272,7 @@ fn apply_file_fixture_with_hook(
                     record.path().as_str(),
                     MaterializedFile {
                         resolved_root: &installed.resolved_root,
-                        fingerprint: installed.fingerprint.into(),
+                        fingerprint: installed.fingerprint,
                     },
                     now_ns(),
                     &event,

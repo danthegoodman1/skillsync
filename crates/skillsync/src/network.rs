@@ -16,7 +16,7 @@ use crate::identity::{DeviceIdentity, EndpointId};
 use crate::join::{
     JOIN_ALPN, JoinCoordinator, JoinDecision, JoinError, PendingJoinInfo, SecretNonce, run_inviter,
 };
-use crate::protocol::{MAX_ADDRESS_HINT_BYTES, MAX_ENDPOINT_ADDRS, ProtocolError};
+use crate::protocol::{MAX_ADDRESS_HINT_BYTES, MAX_ENDPOINT_ADDRS};
 use crate::roster::{RosterChange, RosterMember};
 use crate::setup::now_ns;
 use crate::state::{OperationalEvent, StateError, StateStore};
@@ -32,27 +32,6 @@ const READY_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 pub(crate) static IROH_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum EndpointPlan {
-    N0,
-    Custom {
-        relay_urls: Vec<String>,
-        address_lookup_urls: Vec<String>,
-    },
-}
-
-impl EndpointPlan {
-    pub fn from_config(config: &Config) -> Self {
-        match config.iroh.preset {
-            IrohPreset::N0 => Self::N0,
-            IrohPreset::Custom => Self::Custom {
-                relay_urls: config.iroh.relay_urls.clone(),
-                address_lookup_urls: config.iroh.address_lookup_urls.clone(),
-            },
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SyncSummary {
@@ -348,13 +327,12 @@ fn configured_builder(
     identity: &DeviceIdentity,
 ) -> Result<iroh::endpoint::Builder, NetworkError> {
     let secret = SecretKey::from_bytes(&identity.secret_bytes());
-    let builder = match EndpointPlan::from_config(config) {
-        EndpointPlan::N0 => Endpoint::builder(presets::N0),
-        EndpointPlan::Custom {
-            relay_urls,
-            address_lookup_urls,
-        } => {
-            let relays = relay_urls
+    let builder = match config.iroh.preset {
+        IrohPreset::N0 => Endpoint::builder(presets::N0),
+        IrohPreset::Custom => {
+            let relays = config
+                .iroh
+                .relay_urls
                 .iter()
                 .map(|value| value.parse::<RelayUrl>())
                 .collect::<Result<Vec<_>, _>>()
@@ -362,7 +340,7 @@ fn configured_builder(
             let mut builder = Endpoint::builder(presets::Minimal)
                 .clear_address_lookup()
                 .relay_mode(RelayMode::custom(relays));
-            for value in address_lookup_urls {
+            for value in &config.iroh.address_lookup_urls {
                 let url = value
                     .parse::<Url>()
                     .map_err(|_| NetworkError::InvalidAddressLookupUrl)?;
@@ -493,23 +471,18 @@ async fn run_network_loop(
             }
             completed = tasks.join_next(), if !tasks.is_empty() => {
                 if let Some(Ok(result)) = completed {
-                    if result.outgoing {
-                        outgoing.remove(&result.peer);
-                        if result.success && !waiters.is_empty() {
+                    if result.direction == TaskDirection::Outgoing
+                        && let Some(peer) = result.peer
+                    {
+                        outgoing.remove(&peer);
+                        if result.outcome.succeeded() && !waiters.is_empty() {
                             summary.succeeded = summary.succeeded.saturating_add(1);
                         }
                     }
-                    if result.reconcile_again {
+                    if result.outcome.reconcile_again() {
                         pending_trigger = true;
                     }
-                    record_result(
-                        &paths,
-                        &config,
-                        result.peer,
-                        result.success,
-                        result.rejected,
-                        result.local_failure,
-                    );
+                    record_result(&paths, &config, result.peer, result.outcome);
                 }
             }
             _ = interval.tick() => {}
@@ -518,12 +491,63 @@ async fn run_network_loop(
 }
 
 struct TaskResult {
-    peer: EndpointId,
-    outgoing: bool,
-    success: bool,
-    rejected: bool,
-    local_failure: bool,
-    reconcile_again: bool,
+    peer: Option<EndpointId>,
+    direction: TaskDirection,
+    outcome: TaskOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TaskDirection {
+    Incoming,
+    Outgoing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TaskOutcome {
+    Synchronized { reconcile_again: bool },
+    Unreachable,
+    Rejected { reconcile_again: bool },
+    LocalFailure,
+}
+
+impl TaskOutcome {
+    fn from_sync(result: Result<bool, SyncError>) -> Self {
+        match result {
+            Ok(reconcile_again) => Self::Synchronized { reconcile_again },
+            Err(SyncError::RosterChangedAndUnauthorizedPeer) => Self::Rejected {
+                reconcile_again: true,
+            },
+            Err(error) if error.is_local_failure() => Self::LocalFailure,
+            Err(error) if !error.is_connectivity_failure() => Self::Rejected {
+                reconcile_again: false,
+            },
+            Err(_) => Self::Unreachable,
+        }
+    }
+
+    const fn succeeded(self) -> bool {
+        matches!(self, Self::Synchronized { .. })
+    }
+
+    const fn reconcile_again(self) -> bool {
+        matches!(
+            self,
+            Self::Synchronized {
+                reconcile_again: true
+            } | Self::Rejected {
+                reconcile_again: true
+            }
+        )
+    }
+
+    const fn event(self, peer_endpoint: EndpointId) -> OperationalEvent {
+        match self {
+            Self::Synchronized { .. } => OperationalEvent::PeerSynchronized { peer_endpoint },
+            Self::Unreachable => OperationalEvent::PeerUnreachable { peer_endpoint },
+            Self::Rejected { .. } => OperationalEvent::PeerRejected { peer_endpoint },
+            Self::LocalFailure => OperationalEvent::PeerSessionFailed { peer_endpoint },
+        }
+    }
 }
 
 fn spawn_outgoing(
@@ -538,12 +562,9 @@ fn spawn_outgoing(
     tasks.spawn(async move {
         let Ok(_permit) = semaphore.acquire_owned().await else {
             return TaskResult {
-                peer,
-                outgoing: true,
-                success: false,
-                rejected: false,
-                local_failure: false,
-                reconcile_again: false,
+                peer: Some(peer),
+                direction: TaskDirection::Outgoing,
+                outcome: TaskOutcome::Unreachable,
             };
         };
         record_attempt(&paths, &config, peer);
@@ -564,27 +585,15 @@ fn spawn_outgoing(
             Ok::<bool, NetworkError>(outcome.roster_changed)
         }
         .await;
-        let local_failure = matches!(
-            &result,
-            Err(NetworkError::Sync(error)) if error.is_local_failure()
-        );
-        let rejected = matches!(
-            &result,
-            Err(NetworkError::Sync(error))
-                if !error.is_connectivity_failure() && !error.is_local_failure()
-        );
+        let outcome = match result {
+            Ok(reconcile_again) => TaskOutcome::from_sync(Ok(reconcile_again)),
+            Err(NetworkError::Sync(error)) => TaskOutcome::from_sync(Err(error)),
+            Err(_) => TaskOutcome::Unreachable,
+        };
         TaskResult {
-            peer,
-            outgoing: true,
-            success: result.is_ok(),
-            rejected,
-            local_failure,
-            reconcile_again: result.as_ref().copied().unwrap_or_else(|error| {
-                matches!(
-                    error,
-                    NetworkError::Sync(SyncError::RosterChangedAndUnauthorizedPeer)
-                )
-            }),
+            peer: Some(peer),
+            direction: TaskDirection::Outgoing,
+            outcome,
         }
     });
 }
@@ -607,16 +616,20 @@ fn spawn_incoming(
     tasks.spawn(async move {
         let _permit = permit;
         let connection = tokio::time::timeout(Duration::from_secs(10), accepting).await;
-        let (peer, result, reconcile_again) = match connection {
+        let (peer, outcome) = match connection {
             Ok(Ok(connection)) => {
                 let peer = endpoint_from_iroh(connection.remote_id());
                 match connection.alpn() {
                     JOIN_ALPN => {
-                        let result = run_inviter(connection, context.joins)
-                            .await
-                            .map(|_| peer)
-                            .map_err(|_| SyncError::JoinRejected);
-                        (peer, result, false)
+                        let outcome = match run_inviter(connection, context.joins).await {
+                            Ok(_) => TaskOutcome::Synchronized {
+                                reconcile_again: false,
+                            },
+                            Err(_) => TaskOutcome::Rejected {
+                                reconcile_again: false,
+                            },
+                        };
+                        (Some(peer), outcome)
                     }
                     crate::protocol::ALPN => {
                         let session = SessionConfig::from_daemon(
@@ -628,37 +641,24 @@ fn spawn_incoming(
                         let outcome =
                             run_session_with_outcome(connection, ConnectionSide::Acceptor, session)
                                 .await;
-                        let reconcile_again =
-                            outcome.as_ref().is_ok_and(|outcome| outcome.roster_changed)
-                                || matches!(
-                                    outcome.as_ref(),
-                                    Err(SyncError::RosterChangedAndUnauthorizedPeer)
-                                );
-                        let result = outcome.map(|outcome| outcome.remote_endpoint);
-                        (peer, result, reconcile_again)
+                        let outcome =
+                            TaskOutcome::from_sync(outcome.map(|outcome| outcome.roster_changed));
+                        (Some(peer), outcome)
                     }
                     _ => (
-                        peer,
-                        Err(SyncError::Protocol(ProtocolError::UnexpectedFrame)),
-                        false,
+                        Some(peer),
+                        TaskOutcome::Rejected {
+                            reconcile_again: false,
+                        },
                     ),
                 }
             }
-            _ => (
-                EndpointId::from_bytes([0; 32]),
-                Err(SyncError::Transport),
-                false,
-            ),
+            _ => (None, TaskOutcome::Unreachable),
         };
         TaskResult {
             peer,
-            outgoing: false,
-            success: result.is_ok(),
-            rejected: result
-                .as_ref()
-                .is_err_and(|error| !error.is_connectivity_failure() && !error.is_local_failure()),
-            local_failure: result.as_ref().is_err_and(SyncError::is_local_failure),
-            reconcile_again,
+            direction: TaskDirection::Incoming,
+            outcome,
         }
     });
 }
@@ -716,32 +716,16 @@ fn record_attempt(paths: &PlatformPaths, config: &Config, peer: EndpointId) {
 fn record_result(
     paths: &PlatformPaths,
     config: &Config,
-    peer: EndpointId,
-    success: bool,
-    rejected: bool,
-    local_failure: bool,
+    peer: Option<EndpointId>,
+    outcome: TaskOutcome,
 ) {
-    if peer == EndpointId::from_bytes([0; 32]) {
+    let Some(peer) = peer else {
         return;
-    }
+    };
     if let Ok(mut state) = StateStore::open(&paths.data_dir.join("state.sqlite3")) {
-        let event = if success {
-            OperationalEvent::PeerSynchronized {
-                peer_endpoint: peer,
-            }
-        } else if local_failure {
-            OperationalEvent::PeerSessionFailed {
-                peer_endpoint: peer,
-            }
-        } else if rejected {
-            OperationalEvent::PeerRejected {
-                peer_endpoint: peer,
-            }
-        } else {
-            OperationalEvent::PeerUnreachable {
-                peer_endpoint: peer,
-            }
-        };
+        let event = outcome.event(peer);
+        let success = outcome.succeeded();
+        let rejected = matches!(outcome, TaskOutcome::Rejected { .. });
         let active = state
             .selected_roster_chain()
             .ok()
@@ -944,30 +928,6 @@ mod tests {
             .await?;
         stream.write_all(&body).await?;
         stream.shutdown().await
-    }
-
-    #[test]
-    fn endpoint_plan_preserves_n0_and_custom_configuration() {
-        assert_eq!(
-            EndpointPlan::from_config(&Config::default()),
-            EndpointPlan::N0
-        );
-        let config = Config::from_toml(
-            r#"
-            [iroh]
-            preset = "custom"
-            relay_urls = ["https://relay.example.net"]
-            address_lookup_urls = ["https://lookup.example.net"]
-            "#,
-        )
-        .unwrap();
-        assert_eq!(
-            EndpointPlan::from_config(&config),
-            EndpointPlan::Custom {
-                relay_urls: vec!["https://relay.example.net".to_owned()],
-                address_lookup_urls: vec!["https://lookup.example.net".to_owned()],
-            }
-        );
     }
 
     #[test]
@@ -1207,16 +1167,31 @@ mod tests {
         drop(state);
         let mut config = Config::default();
         config.logging.max_entries = 7;
+        record_result(
+            &paths,
+            &config,
+            None,
+            TaskOutcome::Rejected {
+                reconcile_again: false,
+            },
+        );
+        assert!(
+            StateStore::open(&paths.data_dir.join("state.sqlite3"))
+                .unwrap()
+                .logs()
+                .unwrap()
+                .is_empty()
+        );
         for seed in 0_u16..200 {
             let mut bytes = [0_u8; 32];
             bytes[..2].copy_from_slice(&seed.to_be_bytes());
             record_result(
                 &paths,
                 &config,
-                DeviceIdentity::from_secret(bytes).endpoint_id(),
-                false,
-                true,
-                false,
+                Some(DeviceIdentity::from_secret(bytes).endpoint_id()),
+                TaskOutcome::Rejected {
+                    reconcile_again: false,
+                },
             );
         }
         let state = StateStore::open(&paths.data_dir.join("state.sqlite3")).unwrap();
@@ -1226,6 +1201,39 @@ mod tests {
         assert!(
             logs.iter()
                 .all(|log| matches!(log.event, OperationalEvent::PeerRejected { .. }))
+        );
+    }
+
+    #[test]
+    fn task_outcomes_preserve_sync_and_log_classification() {
+        let peer = DeviceIdentity::from_secret([83; 32]).endpoint_id();
+        assert_eq!(
+            [
+                TaskOutcome::from_sync(Ok(false)).event(peer),
+                TaskOutcome::from_sync(Err(SyncError::Transport)).event(peer),
+                TaskOutcome::from_sync(Err(SyncError::WrongGroup)).event(peer),
+                TaskOutcome::from_sync(Err(SyncError::Io(std::io::Error::other("local"))))
+                    .event(peer),
+            ],
+            [
+                OperationalEvent::PeerSynchronized {
+                    peer_endpoint: peer,
+                },
+                OperationalEvent::PeerUnreachable {
+                    peer_endpoint: peer,
+                },
+                OperationalEvent::PeerRejected {
+                    peer_endpoint: peer,
+                },
+                OperationalEvent::PeerSessionFailed {
+                    peer_endpoint: peer,
+                },
+            ]
+        );
+        assert!(TaskOutcome::from_sync(Ok(true)).reconcile_again());
+        assert!(
+            TaskOutcome::from_sync(Err(SyncError::RosterChangedAndUnauthorizedPeer))
+                .reconcile_again()
         );
     }
 
